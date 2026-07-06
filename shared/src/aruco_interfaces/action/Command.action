@@ -1,6 +1,0 @@
-int32 command_id
----
-bool success
-string message
----
-string status

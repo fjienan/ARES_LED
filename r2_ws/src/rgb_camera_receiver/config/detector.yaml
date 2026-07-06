@@ -1,4 +1,4 @@
-# R2 camera observations. These are intentionally independent from R1 LED RGB values.
+# R2 摄像头观测参数，特意与 R1 LED 的 RGB 输出值相互独立。
 colors:
   RED:    {hue_center: 2,   hue_radius: 13, min_saturation: 100, min_value: 65}
   GREEN:  {hue_center: 74,  hue_radius: 10, min_saturation: 90,  min_value: 55}
@@ -6,8 +6,7 @@ colors:
   BLUE:   {hue_center: 120, hue_radius: 15, min_saturation: 90,  min_value: 55}
   PURPLE: {hue_center: 147, hue_radius: 14, min_saturation: 80,  min_value: 55}
 
-# A physical LED is a compact, locally bright point. These settings reject the
-# long coloured fringes produced by white ceiling lights.
+# 物理 LED 表现为紧凑的局部亮点。以下参数用于排除白色顶灯产生的长条彩色边缘。
 dots:
   min_blob_area: 1
   max_blob_area: 300
@@ -23,16 +22,16 @@ geometry:
   min_length_pixels: 40
   line_distance_pixels: 3.5
   max_gap_ratio: 3.2
-  # Gaps may remain constant or increase/decrease approximately linearly under
-  # perspective. This is the normalized residual around that linear trend.
+  # 受透视影响，点间距可能保持不变，也可能近似线性增大或减小。
+  # 此参数是相对于该线性趋势的归一化残差。
   max_spacing_trend_error: 0.32
   min_coverage: 0.55
   min_valley_contrast: 0.05
-  # Weak reflections and ceiling-light fringes fail these per-bead checks.
+  # 微弱反光和顶灯彩色边缘无法通过这些逐灯珠检查。
   min_periodic_dot_quality: 0.38
   min_periodic_color_quality: 0.45
-  # When distance/exposure merges the beads, accept only a long and thin
-  # saturated component. Short glowing bars are not LED strips.
+  # 当距离或曝光导致灯珠连成一体时，只接受细长且高饱和的连通区域。
+  # 短发光条不视为 LED 灯带。
   continuous_min_area: 30
   continuous_min_length: 80
   continuous_min_aspect: 8.0
@@ -44,8 +43,8 @@ selection:
   min_score: 0.04
   winner_margin: 1.20
 
-# Pair two independently detected monochrome strips into one shared protocol
-# command. The protocol table itself lives in shared/rgb_comm_protocol.
+# 将两段独立检测到的单色灯带配对为一条共享协议命令。
+# 协议表本身位于 shared/rgb_comm_protocol。
 pairing:
   min_pair_score: 0.04
   max_angle_degrees: 18.0

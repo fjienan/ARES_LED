@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show a live USB-camera preview and periodically save raw frames."""
+"""显示 USB 摄像头实时预览，并定期保存原始画面。"""
 
 import argparse
 from datetime import datetime
@@ -40,7 +40,7 @@ def camera_candidates(device: str):
                 f'refusing integrated camera {device} ({camera_name(device)})')
         return [device]
 
-    # Persistent USB-camera names are preferred over unstable /dev/videoX names.
+    # 优先使用稳定的 USB 摄像头持久化名称，而不是可能变化的 /dev/videoX 名称。
     paths = sorted(glob.glob('/dev/v4l/by-id/*-video-index0'))
     paths += sorted(glob.glob('/dev/v4l/by-id/*'))
     paths += sorted(glob.glob('/dev/video*'))

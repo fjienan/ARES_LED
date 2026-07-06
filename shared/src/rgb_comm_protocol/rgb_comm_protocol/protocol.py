@@ -7,7 +7,7 @@ Color = Tuple[int, int, int]
 
 
 class FixedColorProtocol:
-    """Bidirectional mapping between integer commands and color-symbol pairs."""
+    """整数命令与颜色符号对之间的双向映射。"""
 
     def __init__(
             self,

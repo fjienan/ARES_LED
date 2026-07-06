@@ -6,7 +6,7 @@ RED/GREEN/BLUE/CYAN/PURPLE 单色灯带候选，并将两段候选按 shared 协
 ## 目录
 
 ```text
-shared/src/   公共 RGB 协议和 aruco_interfaces/Command.action
+shared/src/   公共 RGB 协议
 r1_ws/src/    R1 编码发送节点；默认通过 USB 串口发送 WLED JSON
 r2_ws/src/    USB 摄像头实时识别和离线数据集评测
 ```
@@ -15,9 +15,8 @@ r2_ws/src/    USB 摄像头实时识别和离线数据集评测
 R1 的物理 RGB 值位于 `r1_ws/src/rgb_led_sender/config/colors.yaml`；R2 的相机观测
 颜色模型位于 `r2_ws/src/rgb_camera_receiver/config/detector.yaml`，两者不得共享数值。
 
-当前 R1 默认不再使用 FT232H，也默认不启动 `led_controller`。R1 发送节点订阅
-`/aruco_comm/tx_id`，通过 WLED 控制器的 USB CDC 串口直接发送 JSON 状态帧；
-`r1_ws/src/led_controller` 保留为旧 Action 实验路径，不作为默认路径。
+当前 R1 发送节点订阅 `/aruco_comm/tx_id`，通过 WLED 控制器的 USB CDC 串口直接发送
+JSON 状态帧。
 
 普通克隆即可获得构建所需的全部源码：
 
@@ -51,8 +50,7 @@ R1 只点亮灯带前两段，后面的灯带全部置灭。每段只使用
 | 7 | BLUE, CYAN |
 | 8 | BLUE, PURPLE |
 
-命令 `0` 是普通通信命令，不再表示清空。R2 会多帧确认后发布命令 ID；机器人 Action
-接入仍保留为后续步骤。
+命令 `0` 是普通通信命令，不再表示清空。R2 会多帧确认后发布命令 ID。
 
 ## R1 构建与启动
 
@@ -176,4 +174,4 @@ source /opt/ros/humble/setup.bash
 ```
 
 当前硬性回归集为单色图像数据集：五种颜色必须全部识别正确，NONE 必须全部零候选。
-R2 另有两段协议解码单元测试；机器人 Action 接入仍保留为后续步骤。
+R2 另有两段协议解码单元测试。

@@ -1,4 +1,4 @@
-"""Generate an R2-only hue model from labelled single-colour captures."""
+"""根据已标注的单色图像生成仅供 R2 使用的色相模型。"""
 
 import argparse
 from dataclasses import replace
@@ -49,8 +49,7 @@ def calibrate(dataset: Path, base_config: Path, output: Path) -> None:
             np.sum(np.cos(angles) * local_weights))
         center = float((angle * 180.0 / (2.0 * np.pi)) % 180.0)
         previous = config['colors'][name]
-        # Labelled frames still contain unrelated background colours. Never
-        # broaden an already validated class boundary from these pixels.
+        # 已标注画面仍包含无关的背景颜色，不能依据这些像素扩大已经验证的类别边界。
         radius = float(min(
             float(previous['hue_radius']),
             np.clip(np.percentile(hue_distance(hues[local], center), 98), 7.0, 18.0)))

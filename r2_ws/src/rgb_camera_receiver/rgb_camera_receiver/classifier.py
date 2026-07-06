@@ -1,9 +1,8 @@
-"""Protocol-independent detection of monochrome addressable LED strips.
+"""与协议无关的单色可寻址 LED 灯带检测。
 
-The detector deliberately separates camera-side colour observations from the
-R1 protocol.  A valid strip is not merely a coloured line: it must be a train
-of compact, similarly coloured light points with a perspective-consistent
-spacing pattern and visible valleys between neighbouring points.
+检测器特意将摄像头侧的颜色观测与 R1 协议分离。有效灯带不能仅是一条彩色线：
+它必须由一列紧凑且颜色相近的光点构成，点间距需符合透视规律，相邻光点之间还应有
+可见的亮度谷值。
 """
 
 from dataclasses import dataclass
@@ -259,9 +258,8 @@ def _point_color_quality(
     hue_quality = 1.0 - float(np.median(
         np.clip(distances[own, own_index], 0.0, 1.0)))
     purity = float(np.count_nonzero(own)) / len(saturated)
-    # White luminaires commonly have only a thin coloured fringe. Requiring a
-    # substantial coloured fraction around the peak rejects that failure mode
-    # while still allowing an overexposed white LED core.
+    # 白色灯具通常只有一圈很薄的彩色边缘。要求峰值周围有足够比例的彩色像素，
+    # 可以排除这种误检，同时仍允许 LED 中心因过曝而呈白色。
     colored_fraction = min(1.0, len(saturated) / max(len(bright) * 0.45, 1.0))
     saturation_quality = min(
         1.0, float(np.median(saturated[own, 1])) / 180.0)
@@ -324,9 +322,8 @@ def _extract_light_points(
             color_quality=color_quality,
         ))
     if recover_merged:
-        # Bloom can connect neighbouring LEDs into one component. Recover each
-        # bead from a local maximum only when the faster continuous-strip path
-        # did not already explain the same colour.
+        # 光晕可能把相邻 LED 连成一个区域。仅当更快的连续灯带路径尚未解释同一颜色时，
+        # 才根据局部极大值恢复各个灯珠。
         local_maxima = (
             (smooth >= cv2.dilate(
                 smooth, np.ones((7, 7), np.uint8)) - 1e-4) &
@@ -592,8 +589,8 @@ def _line_hypotheses(
     valid = np.flatnonzero(lengths >= config.min_length_pixels)
     if len(valid) == 0:
         return []
-    # Long pairs are more likely to span a complete strip. A fixed budget keeps
-    # cluttered scenes deterministic and avoids the old unbounded O(n²) loop.
+    # 较长的点对更可能覆盖完整灯带。固定计算预算可使杂乱场景的结果保持确定，
+    # 并避免旧版无上限的 O(n²) 循环。
     point_quality = np.asarray(
         [item.quality for item in points], dtype=np.float32)
     pair_quality = np.sqrt(
@@ -641,15 +638,14 @@ def _regular_chain(
         projections: np.ndarray,
         points: Sequence[_LightPoint],
         config: DetectorConfig) -> Optional[np.ndarray]:
-    """Select a clean perspective-consistent subsequence from a noisy line."""
+    """从含噪直线中选择符合透视规律的清晰子序列。"""
     count = len(projections)
     if count < config.min_dots:
         return None
     best: Optional[Tuple[Tuple[float, ...], np.ndarray]] = None
     point_qualities = np.asarray(
         [item.quality for item in points], dtype=np.float32)
-    # Quantized short-range differences expose the repeated physical spacing
-    # without trying every possible pair as a chain seed.
+    # 量化后的短程差值能够显现重复的物理间距，无需尝试把每个可能点对都作为链起点。
     gap_histogram: Dict[float, int] = {}
     for offset in range(1, min(5, count)):
         for gap in projections[offset:] - projections[:-offset]:
@@ -867,8 +863,8 @@ def _fit_candidate(
         (valley_contrast - config.min_valley_contrast) /
         max(0.55 - config.min_valley_contrast, 1e-6),
         0.0, 1.0))
-    # Multiplication is intentional: a coloured line with no separate beads, or
-    # a periodic white structure with only a coloured fringe, must stay weak.
+    # 此处有意使用乘法：没有独立灯珠的彩色线，或只有彩色边缘的周期性白色结构，
+    # 其得分必须保持较低。
     score = float(
         line_quality * dot_quality * periodic_quality *
         color_quality * valley_quality)
@@ -943,16 +939,15 @@ def _same_physical_strip(first: StripDetection, second: StripDetection) -> bool:
         return True
     gap = max(first_projection[0], second_projection[0]) - min(
         first_projection[1], second_projection[1])
-    # Exposure and white balance can split one physical monochrome strip into
-    # neighbouring hue components. Treat a collinear gap up to roughly one
-    # shorter component as the same strip and keep only the stronger class.
+    # 曝光和白平衡可能把一条物理单色灯带拆成相邻的色相区域。
+    # 若共线间隙不超过较短区域的大约一倍，则视为同一灯带，并仅保留更强的颜色类别。
     return gap <= max(25.0, min(first.length, second.length) * 2.50)
 
 
 def detect_proposals(
         bgr: np.ndarray,
         config: DetectorConfig) -> List[StripDetection]:
-    """Return structurally valid proposals before the final score threshold."""
+    """返回应用最终分数阈值前结构有效的候选。"""
     if bgr is None or bgr.size == 0:
         return []
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
@@ -1013,7 +1008,7 @@ def select_winner(
     if not candidates:
         return None
     if len(candidates) > 1:
-        # Same-colour reflections do not create an ambiguous class decision.
+        # 同色反光不会造成颜色类别判定歧义。
         different = next(
             (item for item in candidates[1:]
              if item.color != candidates[0].color),

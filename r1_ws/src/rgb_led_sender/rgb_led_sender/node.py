@@ -11,7 +11,7 @@ from std_msgs.msg import Int32
 
 from rgb_comm_protocol import FixedColorProtocol
 
-from .mapping import build_wled_state_json, order_group_colors
+from .mapping import build_wled_state_json
 
 
 _BAUD_RATES = {
@@ -128,25 +128,14 @@ class RgbLedSender(Node):
         self.pending_id: Optional[int] = None
         self.active_command: Optional[int] = None
 
-        self.client = None
-        self.led_pattern_goal_cls = None
-        self.goal_handle = None
-        self.sending_token: Optional[int] = None
-        self.sending_command: Optional[int] = None
-        self.next_token = 0
-        self.canceling = False
-
         self.serial: Optional[LineSerial] = None
         self.serial_device_config = ''
         self.serial_baudrate = 115200
         self.serial_timeout_sec = 0.05
 
-        if self.transport == 'serial':
-            self._init_serial_transport()
-        elif self.transport == 'action':
-            self._init_action_transport()
-        else:
-            raise ValueError("transport must be 'serial' or 'action'")
+        if self.transport != 'serial':
+            raise ValueError("transport must be 'serial'")
+        self._init_serial_transport()
 
         self.create_subscription(Int32, topic, self._on_command, 10)
         self.create_timer(max(retry_period, 0.05), self._dispatch)
@@ -162,51 +151,25 @@ class RgbLedSender(Node):
         self.serial_timeout_sec = float(
             self.declare_parameter('serial_timeout_sec', 0.05).value)
 
-    def _init_action_transport(self) -> None:
-        from rclpy.action import ActionClient
-        from led_controller.action import LedPattern
-
-        action_name = self.declare_parameter('led_action_name', '/led_pattern').value
-        self.led_pattern_goal_cls = LedPattern.Goal
-        self.client = ActionClient(self, LedPattern, action_name)
-        self.get_logger().info(f'action transport configured: action={action_name}')
-
     def _on_command(self, message: Int32) -> None:
         command = int(message.data)
         if self.protocol.encode_symbols(command) is None:
             self.get_logger().warning(f'command ID {command} is not in RGB protocol; ignored')
             return
-        if (
-            command == self.pending_id or
-            command == self.active_command or
-            (command == self.sending_command and self.pending_id is None)
-        ):
+        if command == self.pending_id or command == self.active_command:
             return
         self.pending_id = command
-        if (
-            self.transport == 'action' and
-            self.goal_handle is not None and
-            not self.canceling
-        ):
-            self.canceling = True
-            self.goal_handle.cancel_goal_async().add_done_callback(self._cancel_done)
         self._dispatch()
 
-    def _cancel_done(self, _future) -> None:
-        self.canceling = False
-
     def _dispatch(self) -> None:
-        if self.transport == 'serial':
-            self._dispatch_serial()
-        else:
-            self._dispatch_action()
+        self._dispatch_serial()
 
     def _dispatch_serial(self) -> None:
         if self.pending_id is None:
             return
         device = _find_serial_device(self.serial_device_config)
         if device is None:
-            self.get_logger().warning('C board serial device not found; retrying')
+            self.get_logger().warning('WLED serial device not found; retrying')
             return
         if self.serial is None or self.serial.device != device:
             if self.serial is not None:
@@ -234,79 +197,6 @@ class RgbLedSender(Node):
             self.get_logger().info(f'sent command {command}: {code}; WLED replied: {response}')
         else:
             self.get_logger().info(f'sent command {command}: {code}')
-
-    def _dispatch_action(self) -> None:
-        if (
-            self.pending_id is None or self.canceling or
-            self.goal_handle is not None or self.sending_token is not None
-        ):
-            return
-        assert self.client is not None
-        if not self.client.server_is_ready():
-            return
-        command = self.pending_id
-        rgb = self.protocol.encode_rgb(command)
-        if rgb is None:
-            self.pending_id = None
-            return
-        self.pending_id = None
-        self._send_goal(command, rgb, [self.brightness] * len(rgb))
-
-    def _send_goal(self, command: int, rgb, brightnesses) -> None:
-        assert self.client is not None
-        assert self.led_pattern_goal_cls is not None
-        ordered_groups, ordered_colors = order_group_colors(self.groups, rgb)
-        goal = self.led_pattern_goal_cls()
-        goal.groups = ordered_groups
-        goal.colors = ordered_colors
-        goal.brightnesses = list(brightnesses)
-        goal.blink_hz = [0.0] * len(goal.groups)
-        goal.duration = 0.0
-        self.next_token += 1
-        token = self.next_token
-        self.sending_token = token
-        self.sending_command = command
-        future = self.client.send_goal_async(goal)
-        future.add_done_callback(
-            lambda f, command=command, token=token:
-            self._goal_response(f, command, token))
-
-    def _goal_response(self, future, command: int, token: int) -> None:
-        if token != self.sending_token:
-            return
-        self.sending_token = None
-        self.sending_command = None
-        handle = future.result()
-        if not handle.accepted:
-            if self.pending_id is None:
-                self.get_logger().warning(
-                    f'LED goal for command {command} rejected; retrying')
-                self.pending_id = command
-            else:
-                self.get_logger().warning(
-                    f'LED goal for superseded command {command} rejected')
-            self._dispatch()
-            return
-        self.goal_handle = handle
-        self.active_command = command
-        if self.pending_id is not None:
-            self.canceling = True
-            handle.cancel_goal_async().add_done_callback(self._cancel_done)
-            handle.get_result_async().add_done_callback(
-                lambda f, handle=handle: self._goal_result(f, handle))
-            return
-        code = self.protocol.encode_symbols(command)
-        self.get_logger().info(f'holding command {command}: {code}')
-        handle.get_result_async().add_done_callback(
-            lambda f, handle=handle: self._goal_result(f, handle))
-
-    def _goal_result(self, _future, handle) -> None:
-        if handle is not self.goal_handle:
-            return
-        self.goal_handle = None
-        self.canceling = False
-        self.active_command = None
-        self._dispatch()
 
     def destroy_node(self) -> bool:
         if self.serial is not None:

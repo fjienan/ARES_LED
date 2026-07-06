@@ -25,7 +25,7 @@ from .protocol_decoder import (
 
 
 class LedStripReceiver(Node):
-    """Live camera frontend for the protocol-independent strip detector."""
+    """与协议无关的灯带检测器实时摄像头前端。"""
 
     def __init__(self) -> None:
         super().__init__('rgb_camera_receiver')

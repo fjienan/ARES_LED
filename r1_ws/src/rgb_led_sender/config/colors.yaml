@@ -1,6 +1,6 @@
-# R1 physical WLED JSON RGB values. R2 camera colour models are configured separately.
-# The current WLED/strip path has green/blue swapped at the output, so these are
-# chosen by observed colour, not by nominal channel name.
+# R1 物理 WLED JSON RGB 值。R2 摄像头颜色模型单独配置。
+# 当前 WLED/灯带链路的绿色与蓝色输出通道互换，因此这些数值依据实际观测颜色选取，
+# 而不是依据名义通道名称。
 colors:
   RED: [255, 0, 0]
   GREEN: [0, 0, 255]

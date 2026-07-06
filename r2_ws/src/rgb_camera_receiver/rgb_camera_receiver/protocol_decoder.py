@@ -120,8 +120,8 @@ def _pair_geometry(
     angle_quality = max(0.0, 1.0 - angle / max(config.max_angle_degrees, 1e-6))
     cross_quality = max(
         0.0, 1.0 - cross_distance / max(config.max_cross_distance_pixels, 1e-6))
-    # Adjacent segments normally have center distance close to one segment
-    # length. Make this soft because perspective and partial visibility vary.
+    # 相邻段的中心距离通常接近一段灯带的长度。考虑到透视和局部遮挡的变化，
+    # 此项采用软评分。
     distance_quality = math.exp(-abs(math.log(max(center_distance_ratio, 1e-6))))
     geometry_quality = float(np.clip(
         0.45 * angle_quality + 0.35 * cross_quality + 0.20 * distance_quality,
