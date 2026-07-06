@@ -1,0 +1,14 @@
+rgb_camera_receiver:
+  ros__parameters:
+    camera_profile: odin1
+    input_type: ros_topic
+    image_topic: /odin1/image
+    detector_enabled: false
+    detector_backend: uncalibrated
+
+    # Odin1 尚无训练数据。本配置只能用于采集，检测节点会明确拒绝启动。
+    show_preview: true
+    preview_scale: 0.5
+    processing_scale: 1.0
+    save_positive_images: false
+    detector_config: ""

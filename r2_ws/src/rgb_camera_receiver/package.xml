@@ -2,7 +2,7 @@
 <package format="3">
   <name>rgb_camera_receiver</name>
   <version>0.1.0</version>
-  <description>Protocol-independent five-color LED strip vision for R2.</description>
+  <description>R2 五色灯带开放集视觉检测器。</description>
   <maintainer email="robocon@example.com">robocon</maintainer>
   <license>MIT</license>
   <buildtool_depend>ament_python</buildtool_depend>

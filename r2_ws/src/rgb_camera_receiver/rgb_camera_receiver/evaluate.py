@@ -15,9 +15,16 @@ from .classifier import (
     load_config,
     select_winner,
 )
+from .profiles import (
+    CAMERA_PROFILES,
+    detector_config_path,
+    require_calibrated_detector,
+)
 
 
-CLASSES = ('BLUE', 'CYAN', 'GREEN', 'PURPLE', 'RED', 'NONE')
+CLASSES = ('RED', 'GREEN', 'BLUE', 'YELLOW', 'PURPLE', 'NONE')
+TRAIN_FRACTION = 0.75
+REQUIRED_SCORE_SEPARATION = 3.0
 
 
 def _different_color_margin(candidates) -> float:
@@ -37,7 +44,9 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
     records: List[Dict] = []
     durations = []
     for expected in CLASSES:
-        for image_path in sorted((dataset / expected).glob('*.jpg')):
+        image_paths = sorted((dataset / expected).glob('*.jpg'))
+        train_count = int(math.floor(len(image_paths) * TRAIN_FRACTION))
+        for image_index, image_path in enumerate(image_paths):
             image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image is None:
                 raise RuntimeError(f'cannot read {image_path}')
@@ -55,6 +64,8 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
                 'candidates': candidates,
                 'winner': winner,
                 'margin': _different_color_margin(candidates),
+                'split': (
+                    'train' if image_index < train_count else 'validation'),
             })
 
     true_scores = [
@@ -76,7 +87,30 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
     score_separation = (
         min_true_score / max_false_score
         if max_false_score > 0.0 else math.inf)
-    separation_passed = score_separation >= 2.0
+    separation_passed = score_separation >= REQUIRED_SCORE_SEPARATION
+
+    validation_rows = [
+        row for row in records if row['split'] == 'validation']
+    validation_true_scores = [
+        row['winner'].score for row in validation_rows
+        if row['expected'] != 'NONE' and row['winner'] is not None and
+        row['winner'].color == row['expected']
+    ]
+    validation_false_scores = [
+        item.score
+        for row in validation_rows
+        for item in row['proposals']
+        if row['expected'] == 'NONE' or item.color != row['expected']
+    ]
+    validation_min_true = (
+        min(validation_true_scores) if validation_true_scores else 0.0)
+    validation_max_false = (
+        max(validation_false_scores) if validation_false_scores else 0.0)
+    validation_separation = (
+        validation_min_true / validation_max_false
+        if validation_max_false > 0.0 else math.inf)
+    validation_separation_passed = (
+        validation_separation >= REQUIRED_SCORE_SEPARATION)
 
     output.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -127,6 +161,7 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
             'candidate_count': len(candidates),
             'proposal_count': len(record['proposals']),
             'winner_margin': record['margin'],
+            'split': record['split'],
             'proposals': proposal_data,
         })
 
@@ -146,8 +181,12 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
         'min_true_score': min_true_score,
         'max_false_score': max_false_score,
         'score_separation': score_separation,
-        'required_score_separation': 2.0,
+        'required_score_separation': REQUIRED_SCORE_SEPARATION,
         'separation_passed': separation_passed,
+        'validation_min_true_score': validation_min_true,
+        'validation_max_false_score': validation_max_false,
+        'validation_score_separation': validation_separation,
+        'validation_separation_passed': validation_separation_passed,
         'median_processing_ms': median_ms,
         'p95_processing_ms': p95_ms,
         'results': rows,
@@ -158,7 +197,7 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
             'w', newline='', encoding='utf-8') as stream:
         writer = csv.DictWriter(stream, fieldnames=(
             'image', 'expected', 'actual', 'passed', 'candidate_count',
-            'proposal_count', 'winner_margin', 'proposals'))
+            'proposal_count', 'winner_margin', 'split', 'proposals'))
         writer.writeheader()
         for row in rows:
             flat = dict(row)
@@ -169,28 +208,42 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
         f'evaluated={len(rows)} passed={len(rows)-failures} failed={failures} '
         f'min_true={min_true_score:.6f} max_false={max_false_score:.6f} '
         f'separation={score_separation:.3f} separation_ok={separation_passed} '
+        f'validation_separation={validation_separation:.3f} '
+        f'validation_ok={validation_separation_passed} '
         f'median_ms={median_ms:.1f} p95_ms={p95_ms:.1f} output={output}')
-    return 0 if failures == 0 and separation_passed else 1
+    return (
+        0 if failures == 0 and separation_passed and
+        validation_separation_passed else 1)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Evaluate and annotate the R2 LED dataset')
-    package = Path(__file__).resolve().parents[1]
     parser.add_argument(
-        '--dataset', type=Path,
-        default=package.parents[3] / 'camera_capture')
+        '--camera-profile', choices=CAMERA_PROFILES, default='usb_rgb')
     parser.add_argument(
-        '--output', type=Path,
-        default=package.parents[3] / 'camera_capture_results')
+        '--dataset', type=Path)
     parser.add_argument(
-        '--config', type=Path,
-        default=package / 'config' / 'detector.yaml')
+        '--output', type=Path)
+    parser.add_argument(
+        '--config', type=Path)
     args = parser.parse_args()
+    dataset = args.dataset or (
+        Path('~/Desktop/LED/camera_data').expanduser() /
+        args.camera_profile)
+    output = args.output or (
+        Path('~/Desktop/LED/camera_results').expanduser() /
+        args.camera_profile)
+    config = args.config or detector_config_path(args.camera_profile)
+    metadata = require_calibrated_detector(
+        config.resolve(), args.camera_profile)
+    if metadata.get('algorithm') != 'classical':
+        raise RuntimeError(
+            'evaluate_led_dataset currently supports the classical backend only')
     raise SystemExit(evaluate(
-        args.dataset.resolve(),
-        args.output.resolve(),
-        args.config.resolve()))
+        dataset.resolve(),
+        output.resolve(),
+        config.resolve()))
 
 
 if __name__ == '__main__':

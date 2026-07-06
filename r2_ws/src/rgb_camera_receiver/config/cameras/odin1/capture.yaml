@@ -1,0 +1,7 @@
+source_type: ros_topic
+topic: /odin1/image
+encoding: bgr8
+# Odin1 曝光和增益由驱动工作区的 control_command.yaml 管理，不使用 V4L2。
+driver_config: ~/Desktop/odin_ros2_ws/src/odin_ros_driver/config/control_command.yaml
+interval_sec: 3.0
+jpeg_quality: 95

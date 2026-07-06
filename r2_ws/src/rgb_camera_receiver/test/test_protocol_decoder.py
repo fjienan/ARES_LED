@@ -65,7 +65,7 @@ def test_reverse_order_has_same_meaning():
 
 def test_invalid_protocol_pair_is_rejected():
     candidates = decode_protocol_candidates(
-        [strip('CYAN', 100), strip('PURPLE', 190)], PROTOCOL, CONFIG)
+        [strip('YELLOW', 100), strip('PURPLE', 190)], PROTOCOL, CONFIG)
     assert candidates == []
 
 

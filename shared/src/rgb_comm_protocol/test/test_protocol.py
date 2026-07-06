@@ -27,4 +27,4 @@ def test_all_commands_round_trip():
 def test_unknown_values_are_rejected():
     protocol = FixedColorProtocol()
     assert protocol.encode_symbols(99) is None
-    assert protocol.decode(('CYAN', 'PURPLE')) is None
+    assert protocol.decode(('YELLOW', 'PURPLE')) is None

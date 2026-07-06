@@ -1,0 +1,36 @@
+rgb_camera_receiver:
+  ros__parameters:
+    # 相机配置名称。检测参数从同名目录中的 detector.yaml 加载。
+    camera_profile: usb_rgb
+    input_type: v4l2
+    detector_enabled: true
+    detector_backend: classical
+
+    # auto 会跳过笔记本内置摄像头，并选择首个可读取的外部视频流。
+    camera_device: auto
+    camera_reject_keywords: Integrated,Chicony
+    frame_width: 1280
+    frame_height: 720
+    scan_rate_hz: 30.0
+
+    # 部分 USB 摄像头不提供 V4L2 控制项；留空时不调用 v4l2-ctl。
+    # 支持时格式为：auto_exposure=1,exposure_time_absolute=100,gain=0
+    v4l2_controls: ""
+
+    show_preview: true
+    preview_scale: 0.5
+    processing_scale: 1.0
+
+    # 实时误检采样独立保存到 USB 数据目录，便于之后人工并入 NONE。
+    save_positive_images: true
+    positive_capture_dir: ~/Desktop/LED/camera_data/usb_rgb/positive_review
+    positive_save_interval_sec: 1.0
+
+    # 留空时自动加载当前相机配置目录中的 detector.yaml。
+    detector_config: ""
+    protocol_config: ""
+    output_topic: /aruco_comm/rx_id
+    confirmation_window: 7
+    confirmation_required: 5
+    protocol_winner_margin: 1.20
+    off_unlock_sec: 0.35

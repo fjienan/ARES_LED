@@ -11,7 +11,7 @@ from std_msgs.msg import Int32
 
 from rgb_comm_protocol import FixedColorProtocol
 
-from .mapping import build_wled_state_json
+from .mapping import build_wled_brightness_json, build_wled_state_json
 
 
 _BAUD_RATES = {
@@ -107,7 +107,7 @@ class RgbLedSender(Node):
         topic = self.declare_parameter('input_topic', '/aruco_comm/tx_id').value
         self.transport = str(self.declare_parameter('transport', 'serial').value).lower()
         self.groups = [int(v) for v in self.declare_parameter('groups', [0, 1]).value]
-        self.brightness = float(self.declare_parameter('brightness', 0.2).value)
+        self.brightness = int(self.declare_parameter('brightness', 20).value)
         self.pixel_count = int(self.declare_parameter('pixel_count', 11).value)
         retry_period = float(self.declare_parameter('retry_period_sec', 0.5).value)
 
@@ -119,6 +119,8 @@ class RgbLedSender(Node):
             raise ValueError('groups must contain two distinct LED group indexes')
         if self.pixel_count < 2:
             raise ValueError('pixel_count must be at least 2')
+        if not 0 <= self.brightness <= 255:
+            raise ValueError('brightness must be in range 0..255')
 
         default_colors = os.path.join(
             get_package_share_directory('rgb_led_sender'), 'config', 'colors.yaml')
@@ -182,8 +184,10 @@ class RgbLedSender(Node):
         if code is None or rgb is None:
             self.pending_id = None
             return
-        payload = build_wled_state_json(rgb, self.brightness, self.pixel_count)
+        brightness_payload = build_wled_brightness_json(self.brightness)
+        payload = build_wled_state_json(rgb, self.pixel_count)
         try:
+            self.serial.write_line(f'{brightness_payload}\n')
             response = self.serial.write_line(f'{payload}\n')
         except OSError as exc:
             self.get_logger().warning(f'failed to write WLED serial {device}: {exc}; retrying')

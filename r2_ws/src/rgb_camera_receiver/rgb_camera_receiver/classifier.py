@@ -1,11 +1,10 @@
 """与协议无关的单色可寻址 LED 灯带检测。
 
-检测器特意将摄像头侧的颜色观测与 R1 协议分离。有效灯带不能仅是一条彩色线：
-它必须由一列紧凑且颜色相近的光点构成，点间距需符合透视规律，相邻光点之间还应有
-可见的亮度谷值。
+灯带位置只由亮度、灯珠形状和排列规律决定，颜色随后使用当前相机独立标定的色度模型
+分类。这样既不会把 R1 的发送 RGB 值误当成摄像头观测值，也能对未知颜色作明确拒绝。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -14,18 +13,34 @@ import numpy as np
 import yaml
 
 
+_FEATURE_ARRAY_CACHE: Dict[int, np.ndarray] = {}
+
+
 @dataclass(frozen=True)
 class ColorModel:
     name: str
-    hue_center: float
-    hue_radius: float
-    min_saturation: float
-    min_value: float
+    chroma_center: Tuple[float, float]
+    chroma_covariance: Tuple[Tuple[float, float], Tuple[float, float]]
+    max_distance: float
+    hue_center: Optional[float] = None
+    hue_tolerance: float = 18.0
+    feature_centers: Tuple[Tuple[float, float, float], ...] = ()
+    feature_max_distance: Optional[float] = None
+
+    @property
+    def inverse_covariance(self) -> np.ndarray:
+        covariance = np.asarray(self.chroma_covariance, dtype=np.float32)
+        return np.linalg.inv(covariance)
 
 
 @dataclass(frozen=True)
 class DetectorConfig:
     colors: Tuple[ColorModel, ...]
+    min_saturation: float = 60.0
+    min_value: float = 55.0
+    min_colored_fraction: float = 0.15
+    min_color_support: float = 0.70
+    min_class_margin: float = 1.25
     min_blob_area: int = 1
     max_blob_area: int = 300
     max_blob_aspect: float = 3.5
@@ -36,6 +51,8 @@ class DetectorConfig:
     max_points_per_color: int = 160
     max_pair_hypotheses: int = 2000
     max_line_hypotheses: int = 20
+    fallback_max_pair_hypotheses: int = 10000
+    fallback_max_line_hypotheses: int = 40
     min_dots: int = 6
     min_length_pixels: float = 35.0
     line_distance_pixels: float = 3.5
@@ -45,12 +62,14 @@ class DetectorConfig:
     min_valley_contrast: float = 0.10
     min_periodic_dot_quality: float = 0.38
     min_periodic_color_quality: float = 0.45
-    continuous_min_area: int = 30
-    continuous_min_length: float = 80.0
-    continuous_min_aspect: float = 8.0
-    continuous_min_color_quality: float = 0.75
+    min_geometry_score: float = 0.0
     min_score: float = 0.04
     winner_margin: float = 1.0
+    fast_resize_width: int = 640
+    fast_max_points_per_color: int = 80
+    fast_enable_fallback: bool = False
+    fast_global_search: bool = False
+    fast_check_valley: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,6 +89,11 @@ class StripDetection:
     valley_quality: float = 0.0
     peak_centers: Optional[np.ndarray] = None
     mode: str = 'periodic'
+    geometry_score: float = 0.0
+    class_distance: float = float('inf')
+    class_margin: float = 0.0
+    color_support: float = 0.0
+    chroma: Optional[Tuple[float, float]] = None
 
     def scaled(self, factor: float) -> 'StripDetection':
         peaks = None if self.peak_centers is None else self.peak_centers * factor
@@ -89,6 +113,11 @@ class StripDetection:
             valley_quality=self.valley_quality,
             peak_centers=peaks,
             mode=self.mode,
+            geometry_score=self.geometry_score,
+            class_distance=self.class_distance,
+            class_margin=self.class_margin,
+            color_support=self.color_support,
+            chroma=self.chroma,
         )
 
 
@@ -99,6 +128,8 @@ class _LightPoint:
     response: float
     shape_quality: float
     color_quality: float
+    chroma: Tuple[float, float]
+    hue: Optional[float] = None
 
     @property
     def quality(self) -> float:
@@ -109,18 +140,6 @@ class _LightPoint:
             max(self.color_quality, 0.0)))
 
 
-@dataclass(frozen=True)
-class _ColorComponent:
-    center: np.ndarray
-    axis: np.ndarray
-    length: float
-    width: float
-    area: int
-    aspect: float
-    corners: np.ndarray
-    color_quality: float
-
-
 def load_config(path: str) -> DetectorConfig:
     with Path(path).open('r', encoding='utf-8') as stream:
         raw = yaml.safe_load(stream) or {}
@@ -128,10 +147,22 @@ def load_config(path: str) -> DetectorConfig:
     colors = tuple(
         ColorModel(
             name=str(name).upper(),
-            hue_center=float(values['hue_center']),
-            hue_radius=float(values['hue_radius']),
-            min_saturation=float(values.get('min_saturation', 80)),
-            min_value=float(values.get('min_value', 60)),
+            chroma_center=tuple(
+                float(value) for value in values['chroma_center']),
+            chroma_covariance=tuple(
+                tuple(float(value) for value in row)
+                for row in values['chroma_covariance']),
+            max_distance=float(values.get('max_distance', 3.0)),
+            hue_center=(
+                None if values.get('hue_center') is None
+                else float(values['hue_center'])),
+            hue_tolerance=float(values.get('hue_tolerance', 18.0)),
+            feature_centers=tuple(
+                tuple(float(item) for item in row)
+                for row in values.get('feature_centers', ())),
+            feature_max_distance=(
+                None if values.get('feature_max_distance') is None
+                else float(values['feature_max_distance'])),
         )
         for name, values in color_rows.items()
     )
@@ -139,9 +170,17 @@ def load_config(path: str) -> DetectorConfig:
         raise ValueError('detector config must define at least one color')
     dots = raw.get('dots', {})
     geometry = raw.get('geometry', {})
+    color = raw.get('color_classification', {})
     selection = raw.get('selection', {})
+    fast = raw.get('fast_detection', {})
     return DetectorConfig(
         colors=colors,
+        min_saturation=float(color.get('min_saturation', 60)),
+        min_value=float(color.get('min_value', 55)),
+        min_colored_fraction=float(
+            color.get('min_colored_fraction', 0.15)),
+        min_color_support=float(color.get('min_color_support', 0.70)),
+        min_class_margin=float(color.get('min_class_margin', 1.25)),
         min_blob_area=int(dots.get('min_blob_area', 1)),
         max_blob_area=int(dots.get('max_blob_area', 300)),
         max_blob_aspect=float(dots.get('max_blob_aspect', 3.5)),
@@ -152,6 +191,10 @@ def load_config(path: str) -> DetectorConfig:
         max_points_per_color=int(dots.get('max_points_per_color', 160)),
         max_pair_hypotheses=int(geometry.get('max_pair_hypotheses', 2000)),
         max_line_hypotheses=int(geometry.get('max_line_hypotheses', 20)),
+        fallback_max_pair_hypotheses=int(
+            geometry.get('fallback_max_pair_hypotheses', 10000)),
+        fallback_max_line_hypotheses=int(
+            geometry.get('fallback_max_line_hypotheses', 40)),
         min_dots=int(geometry.get('min_dots', 6)),
         min_length_pixels=float(geometry.get('min_length_pixels', 35)),
         line_distance_pixels=float(geometry.get('line_distance_pixels', 3.5)),
@@ -165,69 +208,38 @@ def load_config(path: str) -> DetectorConfig:
             geometry.get('min_periodic_dot_quality', 0.38)),
         min_periodic_color_quality=float(
             geometry.get('min_periodic_color_quality', 0.45)),
-        continuous_min_area=int(
-            geometry.get('continuous_min_area', 30)),
-        continuous_min_length=float(
-            geometry.get('continuous_min_length', 80)),
-        continuous_min_aspect=float(
-            geometry.get('continuous_min_aspect', 8.0)),
-        continuous_min_color_quality=float(
-            geometry.get('continuous_min_color_quality', 0.75)),
+        min_geometry_score=float(
+            geometry.get('min_geometry_score', 0.0)),
         min_score=float(selection.get('min_score', 0.04)),
         winner_margin=float(selection.get('winner_margin', 1.0)),
+        fast_resize_width=int(fast.get('resize_width', 640)),
+        fast_max_points_per_color=int(
+            fast.get('max_points_per_color', 80)),
+        fast_enable_fallback=bool(fast.get('enable_fallback', False)),
+        fast_global_search=bool(fast.get('global_search', False)),
+        fast_check_valley=bool(fast.get('check_valley', False)),
     )
 
 
-def _hue_distance(hue: np.ndarray, center: float) -> np.ndarray:
-    delta = np.abs(hue.astype(np.float32) - center)
-    return np.minimum(delta, 180.0 - delta)
+def _hue_distance(first: float, second: float) -> float:
+    diff = abs((first - second) % 180.0)
+    return min(diff, 180.0 - diff)
 
 
-def color_masks(hsv: np.ndarray, config: DetectorConfig) -> Dict[str, np.ndarray]:
-    hue_axis = np.arange(180, dtype=np.float32)
-    normalized_distances = np.stack([
-        _hue_distance(hue_axis, model.hue_center) /
-        max(model.hue_radius, 1e-6)
-        for model in config.colors
-    ], axis=1)
-    hue_owner_lut = np.argmin(normalized_distances, axis=1).astype(np.uint8)
-    hue_owner = hue_owner_lut[hsv[:, :, 0]]
-    masks: Dict[str, np.ndarray] = {}
-    for model_index, model in enumerate(config.colors):
-        low = model.hue_center - model.hue_radius
-        high = model.hue_center + model.hue_radius
-        saturation = int(np.clip(model.min_saturation, 0, 255))
-        value = int(np.clip(model.min_value, 0, 255))
-        if low < 0:
-            first = cv2.inRange(
-                hsv, (0, saturation, value),
-                (int(np.floor(high)), 255, 255))
-            second = cv2.inRange(
-                hsv, (int(np.ceil(180 + low)), saturation, value),
-                (179, 255, 255))
-            mask = cv2.bitwise_or(first, second)
-        elif high >= 180:
-            first = cv2.inRange(
-                hsv, (int(np.ceil(low)), saturation, value),
-                (179, 255, 255))
-            second = cv2.inRange(
-                hsv, (0, saturation, value),
-                (int(np.floor(high - 180)), 255, 255))
-            mask = cv2.bitwise_or(first, second)
-        else:
-            mask = cv2.inRange(
-                hsv, (int(np.ceil(low)), saturation, value),
-                (int(np.floor(high)), 255, 255))
-        masks[model.name] = mask.astype(bool) & (hue_owner == model_index)
-    return masks
+def _mean_hue(values: Sequence[float]) -> Optional[float]:
+    if not values:
+        return None
+    radians = np.asarray(values, dtype=np.float32) * np.pi / 90.0
+    angle = float(np.arctan2(np.sin(radians).mean(), np.cos(radians).mean()))
+    return (angle * 90.0 / np.pi) % 180.0
 
 
-def _point_color_quality(
+def _point_chroma(
+        bgr: np.ndarray,
         hsv: np.ndarray,
         center: np.ndarray,
-        model: ColorModel,
-        all_colors: Sequence[ColorModel],
-        radius: int) -> float:
+        config: DetectorConfig,
+        radius: int) -> Optional[Tuple[Tuple[float, float], float]]:
     height, width = hsv.shape[:2]
     x, y = np.round(center).astype(int)
     radius = max(2, min(radius, 8))
@@ -239,44 +251,38 @@ def _point_color_quality(
     yy, xx = np.ogrid[y0 - y:y1 - y, x0 - x:x1 - x]
     disk = xx * xx + yy * yy <= radius * radius
     pixels = patch[disk]
-    bright = pixels[pixels[:, 2] >= model.min_value]
+    bright = pixels[pixels[:, 2] >= config.min_value]
     if len(bright) == 0:
-        return 0.0
-    saturated = bright[bright[:, 1] >= model.min_saturation]
+        return None
+    saturated_mask = (
+        (pixels[:, 1] >= config.min_saturation) &
+        (pixels[:, 2] >= config.min_value))
+    saturated = pixels[saturated_mask]
     if len(saturated) == 0:
-        return 0.0
-    distances = np.stack([
-        _hue_distance(saturated[:, 0], item.hue_center) /
-        max(item.hue_radius, 1e-6)
-        for item in all_colors
-    ], axis=1)
-    nearest = np.argmin(distances, axis=1)
-    own_index = list(all_colors).index(model)
-    own = (nearest == own_index) & (distances[:, own_index] <= 1.0)
-    if not np.any(own):
-        return 0.0
-    hue_quality = 1.0 - float(np.median(
-        np.clip(distances[own, own_index], 0.0, 1.0)))
-    purity = float(np.count_nonzero(own)) / len(saturated)
-    # 白色灯具通常只有一圈很薄的彩色边缘。要求峰值周围有足够比例的彩色像素，
-    # 可以排除这种误检，同时仍允许 LED 中心因过曝而呈白色。
-    colored_fraction = min(1.0, len(saturated) / max(len(bright) * 0.45, 1.0))
+        return None
+    colored_fraction = len(saturated) / max(len(bright), 1)
+    if colored_fraction < config.min_colored_fraction:
+        return None
+    saturated_values = saturated[:, 2]
+    value_cutoff = float(np.percentile(saturated_values, 65))
+    core_mask = saturated_mask & (pixels[:, 2] >= value_cutoff)
+    bgr_patch = bgr[y0:y1, x0:x1][disk][core_mask].astype(np.float32)
+    channel_sum = np.maximum(np.sum(bgr_patch, axis=1), 1.0)
+    normalized = bgr_patch / channel_sum[:, None]
+    chroma = np.median(normalized[:, :2], axis=0)
     saturation_quality = min(
-        1.0, float(np.median(saturated[own, 1])) / 180.0)
-    return float(np.clip(
-        purity * colored_fraction *
-        (0.65 * hue_quality + 0.35 * saturation_quality),
-        0.0, 1.0))
+        1.0, float(np.median(saturated[:, 1])) / 180.0)
+    quality = float(np.clip(
+        np.sqrt(colored_fraction * saturation_quality), 0.0, 1.0))
+    return (float(chroma[0]), float(chroma[1])), quality
 
 
 def _extract_light_points(
+        bgr: np.ndarray,
         hsv: np.ndarray,
         mask: np.ndarray,
-        smooth: np.ndarray,
         dog: np.ndarray,
-        model: ColorModel,
-        config: DetectorConfig,
-        recover_merged: bool = True) -> List[_LightPoint]:
+        config: DetectorConfig) -> List[_LightPoint]:
     response_mask = mask & (dog >= config.min_dog_response)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         response_mask.astype(np.uint8), 8)
@@ -310,73 +316,26 @@ def _extract_light_points(
             continue
         radius = max(1.0, float(np.sqrt(area / np.pi)))
         response = float(np.percentile(weights, 80))
-        color_quality = _point_color_quality(
-            hsv, center, model, config.colors, int(np.ceil(radius + 2.0)))
-        if color_quality <= 0.0:
+        color_result = _point_chroma(
+            bgr, hsv, center, config, int(np.ceil(radius + 2.0)))
+        if color_result is None:
             continue
+        chroma, color_quality = color_result
         points.append(_LightPoint(
             center=center,
             radius=radius,
             response=response,
             shape_quality=float(np.sqrt(compactness)),
             color_quality=color_quality,
+            chroma=chroma,
         ))
-    if recover_merged:
-        # 光晕可能把相邻 LED 连成一个区域。仅当更快的连续灯带路径尚未解释同一颜色时，
-        # 才根据局部极大值恢复各个灯珠。
-        local_maxima = (
-            (smooth >= cv2.dilate(
-                smooth, np.ones((7, 7), np.uint8)) - 1e-4) &
-            (dog >= config.min_dog_response)
-        )
-        peak_count, _, _, peak_centroids = cv2.connectedComponentsWithStats(
-            local_maxima.astype(np.uint8), 8)
-        image_height, image_width = dog.shape
-        for label in range(1, peak_count):
-            center = peak_centroids[label].astype(np.float32)
-            cx, cy = np.round(center).astype(int)
-            radius = 4
-            x0, x1 = max(0, cx - radius), min(
-                image_width, cx + radius + 1)
-            y0, y1 = max(0, cy - radius), min(
-                image_height, cy + radius + 1)
-            patch = dog[y0:y1, x0:x1]
-            peak = float(dog[cy, cx])
-            footprint = patch >= max(
-                config.min_dog_response, peak * 0.30)
-            ys, xs = np.nonzero(footprint)
-            if len(xs) >= 3:
-                coordinates = np.column_stack((
-                    xs.astype(np.float32) + x0,
-                    ys.astype(np.float32) + y0,
-                ))
-                covariance = np.cov(coordinates, rowvar=False)
-                eigenvalues = np.linalg.eigvalsh(covariance)
-                compactness = float(
-                    (eigenvalues[0] + 0.35) /
-                    (eigenvalues[-1] + 0.35))
-            else:
-                compactness = 1.0
-            if compactness < config.min_blob_compactness:
-                continue
-            color_quality = _point_color_quality(
-                hsv, center, model, config.colors, radius)
-            if color_quality <= 0.0:
-                continue
-            points.append(_LightPoint(
-                center=center,
-                radius=max(
-                    1.0, float(np.sqrt(max(len(xs), 1) / np.pi))),
-                response=peak,
-                shape_quality=float(np.sqrt(compactness)),
-                color_quality=color_quality,
-            ))
     points.sort(key=lambda item: item.quality, reverse=True)
     unique: List[_LightPoint] = []
     for point in points:
         if any(
                 np.linalg.norm(point.center - old.center) <
-                max(2.5, min(point.radius + old.radius, 4.0))
+                min(24.0, max(
+                    4.0, max(point.radius, old.radius) * 2.0 + 3.0))
                 for old in unique):
             continue
         unique.append(point)
@@ -385,196 +344,61 @@ def _extract_light_points(
     return unique
 
 
-def _extract_color_components(
+def _extract_saturated_components(
+        bgr: np.ndarray,
         hsv: np.ndarray,
-        mask: np.ndarray,
-        model: ColorModel,
-        config: DetectorConfig) -> List[_ColorComponent]:
-    mask_u8 = mask.astype(np.uint8)
-    nonzero = cv2.findNonZero(mask_u8)
-    if nonzero is None:
-        return []
-    offset_x, offset_y, crop_width, crop_height = cv2.boundingRect(nonzero)
-    cropped_mask = mask_u8[
-        offset_y:offset_y + crop_height,
-        offset_x:offset_x + crop_width]
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        cropped_mask, 8)
-    components: List[_ColorComponent] = []
-    for label in range(1, count):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if area < 5:
-            continue
-        x, y, width, height = stats[label, :4]
-        ys, xs = np.nonzero(
-            labels[y:y + height, x:x + width] == label)
-        ys = ys + y + offset_y
-        xs = xs + x + offset_x
-        coordinates = np.column_stack((xs, ys)).astype(np.float32)
-        center = np.mean(coordinates, axis=0)
-        centered = coordinates - center
-        if len(coordinates) < 3:
-            continue
-        _, _, vt = np.linalg.svd(centered, full_matrices=False)
-        axis = vt[0].astype(np.float32)
-        if axis[0] < 0 or (abs(axis[0]) < 1e-6 and axis[1] < 0):
-            axis = -axis
-        normal = np.array((-axis[1], axis[0]), dtype=np.float32)
-        along = centered @ axis
-        across = centered @ normal
-        low, high = float(np.min(along)), float(np.max(along))
-        length = high - low
-        half_width = max(1.0, float(np.percentile(np.abs(across), 90)))
-        width = half_width * 2.0
-        aspect = length / max(width, 1.0)
-        pixels = hsv[ys, xs]
-        distances = _hue_distance(
-            pixels[:, 0], model.hue_center) / max(model.hue_radius, 1e-6)
-        hue_quality = max(
-            0.0, 1.0 - float(np.median(np.clip(distances, 0.0, 1.0))))
-        saturation_quality = min(
-            1.0, float(np.median(pixels[:, 1])) / 180.0)
-        color_quality = float(np.sqrt(
-            max(hue_quality * saturation_quality, 0.0)))
-        corners = np.array([
-            center + axis * low - normal * (half_width + 1.0),
-            center + axis * high - normal * (half_width + 1.0),
-            center + axis * high + normal * (half_width + 1.0),
-            center + axis * low + normal * (half_width + 1.0),
-        ], dtype=np.float32)
-        components.append(_ColorComponent(
-            center=center,
-            axis=axis,
-            length=length,
-            width=width,
-            area=area,
-            aspect=aspect,
-            corners=corners,
-            color_quality=color_quality,
-        ))
-    components.sort(key=lambda item: item.length, reverse=True)
-    return components
-
-
-def _component_light_points(
-        components: Sequence[_ColorComponent],
         dog: np.ndarray,
         config: DetectorConfig) -> List[_LightPoint]:
-    points = []
-    height, width = dog.shape
-    for component in components:
-        if component.area > config.max_blob_area:
+    """将完整彩色灯珠作为单个连通区域，补偿环形光斑被 DoG 切碎的情况。"""
+    mask = (
+        (hsv[:, :, 1] >= config.min_saturation) &
+        (hsv[:, :, 2] >= config.min_value))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), 8)
+    points: List[_LightPoint] = []
+    for label in range(1, count):
+        x, y, width, height, area = stats[label]
+        if area < 3 or area > max(config.max_blob_area * 4, 600):
             continue
-        if component.aspect > config.max_blob_aspect:
+        aspect = max(width, height) / max(min(width, height), 1)
+        if aspect > config.max_blob_aspect:
             continue
-        x, y = np.round(component.center).astype(int)
-        x = int(np.clip(x, 0, width - 1))
-        y = int(np.clip(y, 0, height - 1))
-        response = float(dog[y, x])
-        if response < config.min_dog_response:
+        ys, xs = np.nonzero(labels[y:y + height, x:x + width] == label)
+        if len(xs) < 3:
             continue
-        shape_quality = float(np.sqrt(
-            min(1.0, 1.0 / max(component.aspect, 1.0))))
+        xs = xs.astype(np.float32) + x
+        ys = ys.astype(np.float32) + y
+        values = hsv[ys.astype(int), xs.astype(int), 2].astype(np.float32)
+        center = np.array([
+            np.average(xs, weights=np.maximum(values, 1.0)),
+            np.average(ys, weights=np.maximum(values, 1.0)),
+        ], dtype=np.float32)
+        coordinates = np.column_stack((xs, ys))
+        covariance = np.cov(coordinates, rowvar=False)
+        eigenvalues = np.linalg.eigvalsh(covariance)
+        compactness = float(
+            (eigenvalues[0] + 0.35) / (eigenvalues[-1] + 0.35))
+        if compactness < config.min_blob_compactness:
+            continue
+        radius = max(1.0, float(np.sqrt(area / np.pi)))
+        color_result = _point_chroma(
+            bgr, hsv, center, config, int(np.ceil(radius + 2.0)))
+        if color_result is None:
+            continue
+        chroma, color_quality = color_result
+        response = float(np.percentile(
+            dog[ys.astype(int), xs.astype(int)], 90))
+        if response < config.min_dog_response * 0.55:
+            continue
         points.append(_LightPoint(
-            center=component.center,
-            radius=max(1.0, float(np.sqrt(component.area / np.pi))),
+            center=center,
+            radius=radius,
             response=response,
-            shape_quality=shape_quality,
-            color_quality=component.color_quality,
+            shape_quality=float(np.sqrt(compactness)),
+            color_quality=color_quality,
+            chroma=chroma,
         ))
-    points.sort(key=lambda item: item.quality, reverse=True)
-    return points[:config.max_points_per_color]
-
-
-def _continuous_proposals(
-        components: Sequence[_ColorComponent],
-        color: str,
-        config: DetectorConfig) -> List[StripDetection]:
-    proposals = []
-    for component in components:
-        if component.area < config.continuous_min_area:
-            continue
-        if component.length < config.continuous_min_length:
-            continue
-        if component.aspect < config.continuous_min_aspect:
-            continue
-        if component.color_quality < config.continuous_min_color_quality:
-            continue
-        line_quality = float(np.clip(
-            (component.aspect - config.continuous_min_aspect) /
-            max(18.0 - config.continuous_min_aspect, 1e-6),
-            0.0, 1.0))
-        length_quality = float(np.clip(
-            (component.length - config.continuous_min_length) / 100.0,
-            0.0, 1.0))
-        support_quality = float(np.sqrt(max(length_quality, 0.04)))
-        score = float(
-            (0.35 + 0.65 * line_quality) *
-            support_quality *
-            component.color_quality)
-        proposals.append(StripDetection(
-            color=color,
-            confidence=float(np.sqrt(max(
-                component.color_quality *
-                (0.35 + 0.65 * line_quality), 0.0))),
-            score=score,
-            corners=component.corners,
-            dot_count=0,
-            length=component.length,
-            residual=component.width * 0.5,
-            spacing_cv=0.0,
-            line_quality=line_quality,
-            dot_quality=1.0,
-            periodic_quality=support_quality,
-            color_quality=component.color_quality,
-            valley_quality=0.0,
-            peak_centers=None,
-            mode='continuous',
-        ))
-    return proposals
-
-
-def _candidate_axis(candidate: StripDetection) -> Tuple[np.ndarray, np.ndarray]:
-    start = (candidate.corners[0] + candidate.corners[3]) * 0.5
-    end = (candidate.corners[1] + candidate.corners[2]) * 0.5
-    axis = end - start
-    axis /= max(float(np.linalg.norm(axis)), 1e-6)
-    return start, axis
-
-
-def _is_short_continuous_bar(
-        candidate: StripDetection,
-        components: Sequence[_ColorComponent],
-        config: DetectorConfig) -> bool:
-    start, axis = _candidate_axis(candidate)
-    normal = np.array((-axis[1], axis[0]), dtype=np.float32)
-    candidate_interval = np.array((0.0, candidate.length))
-    for component in components:
-        if abs(float(axis @ component.axis)) < float(
-                np.cos(np.deg2rad(15.0))):
-            continue
-        if abs(float((component.center - start) @ normal)) > max(
-                8.0, component.width):
-            continue
-        component_center = float((component.center - start) @ axis)
-        component_interval = np.array((
-            component_center - component.length * 0.5,
-            component_center + component.length * 0.5,
-        ))
-        overlap = min(candidate_interval[1], component_interval[1]) - max(
-            candidate_interval[0], component_interval[0])
-        if (
-                component.length >= candidate.length * 0.60 and
-                overlap >= candidate.length * 0.55):
-            valid_continuous_strip = (
-                component.area >= config.continuous_min_area and
-                component.length >= config.continuous_min_length and
-                component.aspect >= config.continuous_min_aspect and
-                component.color_quality >=
-                config.continuous_min_color_quality
-            )
-            return not valid_continuous_strip
-    return False
+    return points
 
 
 def _line_hypotheses(
@@ -598,11 +422,50 @@ def _line_hypotheses(
     pair_rank = lengths * (0.35 + 0.65 * pair_quality)
     order = valid[np.argsort(pair_rank[valid])[::-1]]
     order = order[:config.max_pair_hypotheses]
-    ranked: List[Tuple[float, int, float, np.ndarray]] = []
-    for pair_index in order:
+    # 旧实现逐条在 Python 中计算点到直线的距离，杂乱画面会执行数千次循环。
+    # 这里分批交给 NumPy 计算，只对排名靠前的少量直线恢复点索引。
+    rank_scores = np.full(len(order), -np.inf, dtype=np.float32)
+    batch_size = 256
+    for offset in range(0, len(order), batch_size):
+        batch_pairs = order[offset:offset + batch_size]
+        batch_first = first[batch_pairs]
+        batch_axes = (
+            vectors[batch_pairs] /
+            np.maximum(lengths[batch_pairs, None], 1e-6))
+        batch_normals = np.column_stack(
+            (-batch_axes[:, 1], batch_axes[:, 0]))
+        relative = (
+            centers[None, :, :] -
+            centers[batch_first][:, None, :])
+        projection = np.einsum(
+            'mni,mi->mn', relative, batch_axes)
+        distance = np.abs(np.einsum(
+            'mni,mi->mn', relative, batch_normals))
+        selected_mask = (
+            (distance <= config.line_distance_pixels) &
+            (projection >= -config.line_distance_pixels) &
+            (projection <= (
+                lengths[batch_pairs, None] +
+                config.line_distance_pixels)))
+        counts = np.count_nonzero(selected_mask, axis=1)
+        quality_sum = selected_mask.astype(np.float32) @ point_quality
+        mean_quality = quality_sum / np.maximum(counts, 1)
+        density = counts / np.maximum(lengths[batch_pairs], 1.0)
+        scores = counts * mean_quality * np.sqrt(density)
+        scores[counts < config.min_dots] = -np.inf
+        rank_scores[offset:offset + len(batch_pairs)] = scores
+
+    candidate_count = min(
+        len(order), max(config.max_line_hypotheses * 8, 40))
+    ranked_indexes = np.argsort(rank_scores)[::-1][:candidate_count]
+    hypotheses: List[np.ndarray] = []
+    seen = set()
+    for ranked_index in ranked_indexes:
+        if not np.isfinite(rank_scores[ranked_index]):
+            continue
+        pair_index = order[ranked_index]
         start_index = first[pair_index]
-        end_index = second[pair_index]
-        axis = vectors[pair_index] / lengths[pair_index]
+        axis = vectors[pair_index] / max(lengths[pair_index], 1e-6)
         normal = np.array((-axis[1], axis[0]), dtype=np.float32)
         relative = centers - centers[start_index]
         projection = relative @ axis
@@ -610,20 +473,8 @@ def _line_hypotheses(
         selected = np.flatnonzero(
             (distance <= config.line_distance_pixels) &
             (projection >= -config.line_distance_pixels) &
-            (projection <= lengths[pair_index] + config.line_distance_pixels))
-        if len(selected) < config.min_dots:
-            continue
-        qualities = np.asarray(
-            [points[index].quality for index in selected], dtype=np.float32)
-        density = len(selected) / max(float(lengths[pair_index]), 1.0)
-        rank_score = float(
-            len(selected) * np.median(qualities) * np.sqrt(density))
-        ranked.append((
-            rank_score, len(selected), float(lengths[pair_index]), selected))
-    ranked.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
-    hypotheses: List[np.ndarray] = []
-    seen = set()
-    for _, _, _, selected in ranked:
+            (projection <= lengths[pair_index] +
+             config.line_distance_pixels))
         key = tuple(selected.tolist())
         if key in seen:
             continue
@@ -647,10 +498,13 @@ def _regular_chain(
         [item.quality for item in points], dtype=np.float32)
     # 量化后的短程差值能够显现重复的物理间距，无需尝试把每个可能点对都作为链起点。
     gap_histogram: Dict[float, int] = {}
+    max_seed_gap = max(config.min_length_pixels * 1.8, 36.0)
     for offset in range(1, min(5, count)):
         for gap in projections[offset:] - projections[:-offset]:
             gap = float(gap)
-            if gap < 2.0 or gap > config.min_length_pixels:
+            # 这里限制的是相邻灯珠候选间距，不能直接使用整条灯带的最小长度。
+            # 缩小图中真实灯珠间距可能略大于 min_length_pixels。
+            if gap < 2.0 or gap > max_seed_gap:
                 continue
             quantized = round(gap * 2.0) / 2.0
             gap_histogram[quantized] = gap_histogram.get(quantized, 0) + 1
@@ -740,12 +594,98 @@ def _sample_image(image: np.ndarray, positions: np.ndarray) -> np.ndarray:
     return image[rounded[:, 1], rounded[:, 0]].astype(np.float32)
 
 
+def _sample_local_max(
+        image: np.ndarray,
+        positions: np.ndarray,
+        radius: int = 6) -> np.ndarray:
+    height, width = image.shape[:2]
+    values = []
+    for x_value, y_value in np.round(positions).astype(int):
+        x0, x1 = max(0, x_value - radius), min(
+            width, x_value + radius + 1)
+        y0, y1 = max(0, y_value - radius), min(
+            height, y_value + radius + 1)
+        patch = image[y0:y1, x0:x1]
+        values.append(float(np.max(patch)) if patch.size else 0.0)
+    return np.asarray(values, dtype=np.float32)
+
+
+def _chroma_distance(
+        chroma: Sequence[float],
+        model: ColorModel) -> float:
+    delta = np.asarray(chroma, dtype=np.float32) - np.asarray(
+        model.chroma_center, dtype=np.float32)
+    squared = float(delta @ model.inverse_covariance @ delta)
+    return float(np.sqrt(max(squared, 0.0)))
+
+
+def _feature_array(model: ColorModel) -> np.ndarray:
+    cached = _FEATURE_ARRAY_CACHE.get(id(model))
+    if cached is None:
+        cached = np.asarray(model.feature_centers, dtype=np.float32)
+        _FEATURE_ARRAY_CACHE[id(model)] = cached
+    return cached
+
+
+def _model_distance(
+        chroma: Sequence[float],
+        model: ColorModel,
+        hue: Optional[float] = None) -> float:
+    if hue is not None and model.feature_centers:
+        features = _feature_array(model)
+        blue = (float(chroma[0]) - features[:, 0]) / 0.08
+        green = (float(chroma[1]) - features[:, 1]) / 0.08
+        hue_delta = np.abs((float(hue) - features[:, 2]) % 180.0)
+        hue_term = np.minimum(hue_delta, 180.0 - hue_delta) / 14.0
+        squared = blue * blue + green * green + hue_term * hue_term
+        return float(np.sqrt(float(np.min(squared))))
+    chroma_distance = _chroma_distance(chroma, model)
+    if hue is None or model.hue_center is None:
+        return chroma_distance
+    hue_term = (
+        _hue_distance(hue, model.hue_center) /
+        max(model.hue_tolerance, 1e-6))
+    return float(np.sqrt(chroma_distance ** 2 + (hue_term * 2.0) ** 2))
+
+
+def _model_limit(model: ColorModel) -> float:
+    if model.feature_centers and model.feature_max_distance is not None:
+        return model.feature_max_distance
+    return model.max_distance
+
+
+def _classify_chroma(
+        chroma: Sequence[float],
+        config: DetectorConfig,
+        hue: Optional[float] = None) -> Tuple[
+            Optional[ColorModel], float, float]:
+    best_model: Optional[ColorModel] = None
+    best_distance = float('inf')
+    second_distance = float('inf')
+    for model in config.colors:
+        distance = _model_distance(chroma, model, hue)
+        if distance < best_distance:
+            second_distance = best_distance
+            best_distance = distance
+            best_model = model
+        elif distance < second_distance:
+            second_distance = distance
+    if best_model is None:
+        return None, float('inf'), 0.0
+    margin = second_distance / max(best_distance, 1e-6)
+    if (
+            best_distance > _model_limit(best_model) or
+            margin < config.min_class_margin):
+        return None, best_distance, margin
+    return best_model, best_distance, margin
+
+
 def _fit_candidate(
         points: Sequence[_LightPoint],
         indexes: np.ndarray,
         dog: np.ndarray,
         config: DetectorConfig,
-        color: str) -> Optional[StripDetection]:
+        model: Optional[ColorModel]) -> Optional[StripDetection]:
     selected_points = [points[index] for index in indexes]
     selected = np.asarray(
         [item.center for item in selected_points], dtype=np.float32)
@@ -834,7 +774,7 @@ def _fit_candidate(
     if coverage < config.min_coverage:
         return None
 
-    peak_response = _sample_image(dog, selected)
+    peak_response = _sample_local_max(dog, selected)
     midpoints = (selected[:-1] + selected[1:]) * 0.5
     valley_response = _sample_image(dog, midpoints)
     pair_peaks = np.minimum(peak_response[:-1], peak_response[1:])
@@ -865,9 +805,39 @@ def _fit_candidate(
         0.0, 1.0))
     # 此处有意使用乘法：没有独立灯珠的彩色线，或只有彩色边缘的周期性白色结构，
     # 其得分必须保持较低。
-    score = float(
+    geometry_score = float(
         line_quality * dot_quality * periodic_quality *
         color_quality * valley_quality)
+    chroma_values = np.asarray(
+        [item.chroma for item in selected_points], dtype=np.float32)
+    candidate_chroma = np.median(chroma_values, axis=0)
+    class_distance = float('inf')
+    class_margin = 0.0
+    color_support = 1.0
+    if model is None:
+        color = 'UNKNOWN'
+        score = geometry_score
+        confidence = float(np.sqrt(max(
+            color_quality * periodic_quality, 0.0)))
+    else:
+        classified, class_distance, class_margin = _classify_chroma(
+            candidate_chroma, config)
+        if classified is None or classified.name != model.name:
+            return None
+        point_distances = np.asarray([
+            _chroma_distance(item.chroma, model)
+            for item in selected_points
+        ], dtype=np.float32)
+        color_support = float(np.count_nonzero(
+            point_distances <= model.max_distance) / len(point_distances))
+        if color_support < config.min_color_support:
+            return None
+        normalized_distance = class_distance / max(model.max_distance, 1e-6)
+        class_likelihood = float(np.exp(-0.5 * normalized_distance ** 2))
+        confidence = float(np.clip(
+            class_likelihood * np.sqrt(color_support), 0.0, 1.0))
+        score = geometry_score * confidence
+        color = model.name
     half_width = max(
         3.0,
         residual + float(np.median(
@@ -879,7 +849,6 @@ def _fit_candidate(
         center + axis * high + normal * half_width,
         center + axis * low + normal * half_width,
     ], dtype=np.float32)
-    confidence = float(np.sqrt(max(color_quality * periodic_quality, 0.0)))
     return StripDetection(
         color=color,
         confidence=confidence,
@@ -896,6 +865,11 @@ def _fit_candidate(
         valley_quality=valley_quality,
         peak_centers=selected,
         mode='periodic',
+        geometry_score=geometry_score,
+        class_distance=class_distance,
+        class_margin=class_margin,
+        color_support=color_support,
+        chroma=(float(candidate_chroma[0]), float(candidate_chroma[1])),
     )
 
 
@@ -944,12 +918,9 @@ def _same_physical_strip(first: StripDetection, second: StripDetection) -> bool:
     return gap <= max(25.0, min(first.length, second.length) * 2.50)
 
 
-def detect_proposals(
+def _prepare_light_points(
         bgr: np.ndarray,
-        config: DetectorConfig) -> List[StripDetection]:
-    """返回应用最终分数阈值前结构有效的候选。"""
-    if bgr is None or bgr.size == 0:
-        return []
+        config: DetectorConfig) -> Tuple[np.ndarray, List[_LightPoint]]:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     value = hsv[:, :, 2].astype(np.float32)
     smooth = cv2.GaussianBlur(
@@ -957,32 +928,30 @@ def detect_proposals(
     broad = cv2.GaussianBlur(
         value, (0, 0), config.dog_sigma_large)
     dog = smooth - broad
-    masks = color_masks(hsv, config)
-    raw: List[StripDetection] = []
-    for model in config.colors:
-        components = _extract_color_components(
-            hsv, masks[model.name], model, config)
-        continuous = _continuous_proposals(
-            components, model.name, config)
-        raw.extend(continuous)
-        if continuous:
+    bright_mask = hsv[:, :, 2] >= config.min_value
+    points = _extract_light_points(
+        bgr, hsv, bright_mask, dog, config)
+    points.extend(_extract_saturated_components(bgr, hsv, dog, config))
+    points.sort(key=lambda item: item.quality, reverse=True)
+    unique: List[_LightPoint] = []
+    for point in points:
+        if any(
+                np.linalg.norm(point.center - old.center) <
+                min(24.0, max(
+                    4.0, max(point.radius, old.radius) * 2.0 + 3.0))
+                for old in unique):
             continue
-        points = _component_light_points(components, dog, config)
-        for indexes in _line_hypotheses(points, config):
-            candidate = _fit_candidate(
-                points, indexes, dog, config, model.name)
-            if candidate is None:
-                continue
-            if candidate.dot_quality < config.min_periodic_dot_quality:
-                continue
-            if candidate.color_quality < config.min_periodic_color_quality:
-                continue
-            if _is_short_continuous_bar(candidate, components, config):
-                continue
-            raw.append(candidate)
-    raw.sort(key=lambda item: item.score, reverse=True)
+        unique.append(point)
+        if len(unique) >= config.max_points_per_color:
+            break
+    return dog, unique
+
+
+def _suppress_duplicate_proposals(
+        raw: Sequence[StripDetection]) -> List[StripDetection]:
+    ordered = sorted(raw, key=lambda item: item.score, reverse=True)
     kept: List[StripDetection] = []
-    for candidate in raw:
+    for candidate in ordered:
         if any(
                 _overlap(candidate, existing) >= 0.55 or
                 _same_physical_strip(candidate, existing) or
@@ -991,6 +960,635 @@ def detect_proposals(
             continue
         kept.append(candidate)
     return kept
+
+
+def sample_candidate_chroma(
+        bgr: np.ndarray,
+        candidate: StripDetection,
+        config: DetectorConfig) -> Optional[
+            Tuple[Tuple[float, float], float]]:
+    """在候选灯带内部提取去亮度化色度，并返回彩色像素比例。"""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    region = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    corners = np.round(candidate.corners).astype(np.int32)
+    cv2.fillConvexPoly(region, corners, 1)
+    region = cv2.dilate(
+        region,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+    inside = region.astype(bool)
+    bright = inside & (hsv[:, :, 2] >= config.min_value)
+    bright_count = int(np.count_nonzero(bright))
+    if bright_count == 0:
+        return None
+    colored = (
+        bright &
+        (hsv[:, :, 1] >= config.min_saturation))
+    colored_count = int(np.count_nonzero(colored))
+    colored_fraction = colored_count / bright_count
+    if colored_count == 0 or colored_fraction < config.min_colored_fraction:
+        return None
+    values = hsv[:, :, 2][colored]
+    # 低亮度彩色光晕受曝光和背景影响较大；最高亮的一成像素更接近 LED 发光核心，
+    # 与整幅标定图使用的特征保持一致。
+    cutoff = float(np.percentile(values, 90))
+    selected = colored & (hsv[:, :, 2] >= cutoff)
+    pixels = bgr[selected].astype(np.float32)
+    normalized = pixels / np.maximum(
+        np.sum(pixels, axis=1, keepdims=True), 1.0)
+    chroma = np.median(normalized[:, :2], axis=0)
+    return (
+        (float(chroma[0]), float(chroma[1])),
+        float(colored_fraction),
+    )
+
+
+def _classify_geometry_candidate(
+        bgr: np.ndarray,
+        candidate: StripDetection,
+        config: DetectorConfig) -> Optional[StripDetection]:
+    sampled = sample_candidate_chroma(bgr, candidate, config)
+    if sampled is None:
+        return None
+    chroma, colored_fraction = sampled
+    model, distance, margin = _classify_chroma(chroma, config)
+    if model is None:
+        return None
+    normalized_distance = distance / max(model.max_distance, 1e-6)
+    confidence = float(np.exp(-0.5 * normalized_distance ** 2))
+    return replace(
+        candidate,
+        color=model.name,
+        confidence=confidence,
+        score=candidate.geometry_score * confidence,
+        class_distance=distance,
+        class_margin=margin,
+        color_support=colored_fraction,
+        chroma=chroma,
+    )
+
+
+def _scaled_fast_config(
+        config: DetectorConfig,
+        scale: float) -> DetectorConfig:
+    """把按原图调好的几何阈值映射到快速检测用的缩小图。"""
+    if scale >= 0.999:
+        return config
+    area_scale = scale * scale
+    return replace(
+        config,
+        min_blob_area=max(1, int(round(config.min_blob_area * area_scale))),
+        max_blob_area=max(8, int(round(config.max_blob_area * area_scale))),
+        min_length_pixels=max(
+            12.0, config.min_length_pixels * scale),
+        line_distance_pixels=max(
+            1.8, config.line_distance_pixels * scale),
+        min_dog_response=config.min_dog_response * scale,
+    )
+
+
+def _resize_for_fast_path(
+        bgr: np.ndarray,
+        config: DetectorConfig) -> Tuple[np.ndarray, float]:
+    """固定快速路径的处理宽度，避免 720p 图像上做全量几何搜索。"""
+    height, width = bgr.shape[:2]
+    target_width = max(1, config.fast_resize_width)
+    if width <= target_width:
+        return bgr, 1.0
+    scale = target_width / float(width)
+    resized = cv2.resize(
+        bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
+def _extract_fast_light_points(
+        bgr: np.ndarray,
+        config: DetectorConfig) -> List[_LightPoint]:
+    """直接从高饱和小光斑提取灯珠中心，避免旧版 DoG 全图搜索。"""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask = (
+        (hsv[:, :, 1] >= config.min_saturation) &
+        (hsv[:, :, 2] >= config.min_value))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), 8)
+    points: List[_LightPoint] = []
+
+    def add_point(
+            absolute_x: np.ndarray,
+            absolute_y: np.ndarray,
+            area: int,
+            width: int,
+            height: int,
+            fill: float,
+            allowed_colors: Optional[set] = None) -> bool:
+        if len(absolute_x) < 2:
+            return False
+        values = hsv[
+            absolute_y.astype(np.int32),
+            absolute_x.astype(np.int32),
+            2,
+        ].astype(np.float32)
+        weights = np.maximum(values, 1.0)
+        center = np.array([
+            np.average(absolute_x, weights=weights),
+            np.average(absolute_y, weights=weights),
+        ], dtype=np.float32)
+        saturation = hsv[
+            absolute_y.astype(np.int32),
+            absolute_x.astype(np.int32),
+            1,
+        ].astype(np.float32)
+        saturation_max = float(np.max(saturation))
+        value_max = float(np.max(values))
+        saturation_cutoff = max(
+            config.min_saturation, saturation_max * 0.55)
+        value_low = max(config.min_value, value_max * 0.35)
+        # LED 核心容易过曝偏白；取高饱和中高亮区域，避免逐点分位数计算造成卡顿。
+        core = (
+            (saturation >= saturation_cutoff) &
+            (values >= value_low))
+        if np.count_nonzero(core) < 2:
+            core = saturation >= max(
+                config.min_saturation, saturation_max * 0.45)
+        if np.count_nonzero(core) < 2:
+            core = np.ones(len(absolute_x), dtype=bool)
+        pixels = bgr[
+            absolute_y[core].astype(np.int32),
+            absolute_x[core].astype(np.int32),
+        ].astype(np.float32)
+        if len(pixels) == 0:
+            return False
+        hue = _mean_hue(
+            hsv[
+                absolute_y[core].astype(np.int32),
+                absolute_x[core].astype(np.int32),
+                0,
+            ].astype(np.float32).tolist())
+        normalized = pixels / np.maximum(
+            np.sum(pixels, axis=1, keepdims=True), 1.0)
+        chroma = np.mean(normalized[:, :2], axis=0)
+        if allowed_colors is not None:
+            model, _, _ = _classify_chroma(chroma, config, hue)
+            if model is None or model.name not in allowed_colors:
+                return False
+        box_compactness = min(width, height) / max(max(width, height), 1)
+        shape_quality = float(np.sqrt(np.clip(
+            box_compactness * min(fill / 0.55, 1.0), 0.0, 1.0)))
+        color_quality = float(np.clip(
+            np.sqrt(
+                min(float(np.mean(saturation)) / 180.0, 1.0) *
+                min(float(np.mean(values)) / 180.0, 1.0)),
+            0.0,
+            1.0,
+        ))
+        points.append(_LightPoint(
+            center=center,
+            radius=max(1.0, float(np.sqrt(area / np.pi))),
+            response=value_max,
+            shape_quality=shape_quality,
+            color_quality=color_quality,
+            chroma=(float(chroma[0]), float(chroma[1])),
+            hue=hue,
+        ))
+        return True
+
+    for label in range(1, count):
+        x, y, width, height, area = stats[label]
+        if area < max(config.min_blob_area, 1):
+            continue
+        aspect = max(width, height) / max(min(width, height), 1)
+        fill = area / max(width * height, 1)
+        local = labels[y:y + height, x:x + width] == label
+        ys, xs = np.nonzero(local)
+        if len(xs) < 2:
+            continue
+        oversized = (
+            area > max(config.max_blob_area * 3, 24) or
+            aspect > config.max_blob_aspect or
+            fill < 0.16)
+        if oversized:
+            values_patch = hsv[y:y + height, x:x + width, 2]
+            saturation_patch = hsv[y:y + height, x:x + width, 1]
+            value_data = values_patch[local].astype(np.float32)
+            saturation_data = saturation_patch[local].astype(np.float32)
+            if len(value_data) == 0:
+                continue
+            # 光晕可能把一串灯珠连成一个大组件；用较亮的局部峰值重新切分。
+            value_cutoff = max(
+                config.min_value,
+                float(np.mean(value_data)) +
+                (float(np.max(value_data)) - float(np.mean(value_data))) *
+                0.30)
+            saturation_cutoff = max(
+                config.min_saturation,
+                float(np.max(saturation_data)) * 0.45)
+            peak_mask = (
+                local &
+                (values_patch >= value_cutoff) &
+                (saturation_patch >= saturation_cutoff))
+            sub_count, sub_labels, sub_stats, _ = (
+                cv2.connectedComponentsWithStats(
+                    peak_mask.astype(np.uint8), 8))
+            added = 0
+            for sub_label in range(1, sub_count):
+                sx, sy, sw, sh, sub_area = sub_stats[sub_label]
+                if sub_area < 2 or sub_area > max(config.max_blob_area, 32):
+                    continue
+                sub_aspect = max(sw, sh) / max(min(sw, sh), 1)
+                if sub_aspect > config.max_blob_aspect:
+                    continue
+                sub_local = sub_labels[
+                    sy:sy + sh, sx:sx + sw] == sub_label
+                sub_y, sub_x = np.nonzero(sub_local)
+                sub_fill = sub_area / max(sw * sh, 1)
+                if add_point(
+                        sub_x.astype(np.float32) + x + sx,
+                        sub_y.astype(np.float32) + y + sy,
+                        int(sub_area),
+                        int(sw),
+                        int(sh),
+                        float(sub_fill),
+                        {'BLUE', 'PURPLE'}):
+                    added += 1
+            if added:
+                continue
+            continue
+        absolute_x = xs.astype(np.float32) + x
+        absolute_y = ys.astype(np.float32) + y
+        add_point(
+            absolute_x,
+            absolute_y,
+            int(area),
+            int(width),
+            int(height),
+            float(fill))
+    points.sort(key=lambda item: item.quality, reverse=True)
+    return points
+
+
+def _fit_fast_candidate(
+        points: Sequence[_LightPoint],
+        indexes: np.ndarray,
+        config: DetectorConfig,
+        model: Optional[ColorModel],
+        value_image: Optional[np.ndarray] = None) -> Optional[StripDetection]:
+    """在同色灯珠集合中快速拟合一条独立、等间距的灯带。"""
+    selected_points = [points[index] for index in indexes]
+    if len(selected_points) < config.min_dots:
+        return None
+    selected = np.asarray(
+        [item.center for item in selected_points], dtype=np.float32)
+    center = np.mean(selected, axis=0)
+    centered = selected - center
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    axis = vt[0].astype(np.float32)
+    if axis[0] < 0 or (abs(axis[0]) < 1e-6 and axis[1] < 0):
+        axis = -axis
+    normal = np.array((-axis[1], axis[0]), dtype=np.float32)
+    projection = centered @ axis
+    order = np.argsort(projection)
+    projection = projection[order]
+    selected = selected[order]
+    selected_points = [selected_points[index] for index in order]
+
+    raw_gaps = np.diff(projection)
+    raw_consistent = False
+    if len(raw_gaps) >= config.min_dots - 1 and np.all(raw_gaps > 0.75):
+        gap_axis = np.arange(len(raw_gaps), dtype=np.float32)
+        centered_gap_axis = gap_axis - float(np.mean(gap_axis))
+        slope = float(
+            (centered_gap_axis @ raw_gaps) /
+            max(centered_gap_axis @ centered_gap_axis, 1e-6))
+        intercept = float(np.mean(raw_gaps) - slope * np.mean(gap_axis))
+        predicted = intercept + slope * gap_axis
+        trend_error = float(
+            np.sqrt(np.mean(np.square(raw_gaps - predicted))) /
+            max(float(np.median(raw_gaps)), 1e-6))
+        raw_consistent = (
+            np.all(predicted > 0.5) and
+            float(np.max(raw_gaps) / max(np.min(raw_gaps), 1e-6)) <=
+            config.max_gap_ratio and
+            trend_error <= config.max_spacing_trend_error
+        )
+    if not raw_consistent:
+        chain = _regular_chain(projection, selected_points, config)
+        if chain is None:
+            return None
+        projection = projection[chain]
+        selected = selected[chain]
+        selected_points = [selected_points[index] for index in chain]
+
+    center = np.mean(selected, axis=0)
+    centered = selected - center
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    axis = vt[0].astype(np.float32)
+    if axis[0] < 0 or (abs(axis[0]) < 1e-6 and axis[1] < 0):
+        axis = -axis
+    normal = np.array((-axis[1], axis[0]), dtype=np.float32)
+    projection = centered @ axis
+    order = np.argsort(projection)
+    projection = projection[order]
+    selected = selected[order]
+    selected_points = [selected_points[index] for index in order]
+    residuals = np.abs(centered @ normal)
+    residual = float(np.percentile(residuals, 90))
+    length = float(projection[-1] - projection[0])
+    if length < config.min_length_pixels:
+        return None
+    if residual > config.line_distance_pixels * 1.35:
+        return None
+    gaps = np.diff(projection)
+    if len(gaps) < config.min_dots - 1 or np.any(gaps <= 0.75):
+        return None
+    median_gap = float(np.median(gaps))
+    if float(np.max(gaps) / max(np.min(gaps), 1e-6)) > config.max_gap_ratio:
+        return None
+    gap_axis = np.arange(len(gaps), dtype=np.float32)
+    centered_gap_axis = gap_axis - float(np.mean(gap_axis))
+    slope = float(
+        (centered_gap_axis @ gaps) /
+        max(centered_gap_axis @ centered_gap_axis, 1e-6))
+    intercept = float(np.mean(gaps) - slope * np.mean(gap_axis))
+    predicted_gaps = intercept + slope * gap_axis
+    if np.any(predicted_gaps <= 0.5):
+        return None
+    trend_error = float(
+        np.sqrt(np.mean(np.square(gaps - predicted_gaps))) /
+        max(median_gap, 1e-6))
+    if trend_error > config.max_spacing_trend_error:
+        return None
+    expected = max(length / max(float(np.mean(gaps)), 1.0) + 1.0, 1.0)
+    coverage = min(1.0, len(selected) / expected)
+    if coverage < config.min_coverage:
+        return None
+
+    radii = np.asarray([item.radius for item in selected_points], dtype=np.float32)
+    radius_quality = float(np.clip(
+        (median_gap - float(np.median(radii)) * 1.4) /
+        max(median_gap, 1e-6),
+        0.0,
+        1.0,
+    ))
+    line_quality = float(np.exp(
+        -np.square(residual / max(config.line_distance_pixels, 1e-6))))
+    trend_quality = float(np.exp(
+        -np.square(trend_error /
+                   max(config.max_spacing_trend_error, 1e-6))))
+    periodic_quality = float(np.clip(
+        trend_quality * np.sqrt(coverage) * np.sqrt(radius_quality),
+        0.0,
+        1.0,
+    ))
+    valley_quality = 1.0
+    reported_valley_quality = radius_quality
+    if value_image is not None and len(selected) >= 2:
+        sample_radius = max(2, int(round(float(np.median(radii)) * 1.3)))
+        peak_response = _sample_local_max(
+            value_image, selected, radius=sample_radius)
+        midpoints = (selected[:-1] + selected[1:]) * 0.5
+        valley_response = _sample_local_max(
+            value_image, midpoints, radius=max(1, sample_radius // 2))
+        pair_peaks = np.minimum(peak_response[:-1], peak_response[1:])
+        contrasts = (
+            (pair_peaks - valley_response) /
+            np.maximum(pair_peaks, 1.0))
+        valley_contrast = float(np.median(np.clip(contrasts, 0.0, 1.0)))
+        if valley_contrast < config.min_valley_contrast:
+            return None
+        valley_quality = float(np.clip(
+            (valley_contrast - config.min_valley_contrast) /
+            max(0.55 - config.min_valley_contrast, 1e-6),
+            0.0,
+            1.0,
+        ))
+        reported_valley_quality = valley_quality
+    dot_quality = float(np.median(
+        [item.quality for item in selected_points]))
+    color_quality = float(np.median(
+        [item.color_quality for item in selected_points]))
+    chroma_values = np.asarray(
+        [item.chroma for item in selected_points], dtype=np.float32)
+    candidate_chroma = np.median(chroma_values, axis=0)
+    candidate_hue = _mean_hue([
+        item.hue for item in selected_points if item.hue is not None])
+    classified, class_distance, class_margin = _classify_chroma(
+        candidate_chroma, config, candidate_hue)
+    if classified is None:
+        return None
+    if model is not None and classified.name != model.name:
+        return None
+    model = classified
+    point_distances = np.asarray([
+        _model_distance(item.chroma, model, item.hue)
+        for item in selected_points
+    ], dtype=np.float32)
+    color_support = float(np.count_nonzero(
+        point_distances <= _model_limit(model)) / len(point_distances))
+    if color_support < config.min_color_support:
+        return None
+    normalized_distance = class_distance / max(_model_limit(model), 1e-6)
+    confidence = float(np.clip(
+        np.exp(-0.5 * normalized_distance ** 2) *
+        np.sqrt(color_support),
+        0.0,
+        1.0,
+    ))
+    geometry_score = float(
+        line_quality * dot_quality * periodic_quality *
+        color_quality * valley_quality)
+    if geometry_score < config.min_geometry_score:
+        return None
+    score = geometry_score * confidence
+    spacing_cv = float(np.std(gaps) / max(np.mean(gaps), 1e-6))
+    half_width = max(
+        2.5,
+        residual + float(np.median(radii)) + 1.5)
+    low, high = float(projection[0]), float(projection[-1])
+    corners = np.array([
+        center + axis * low - normal * half_width,
+        center + axis * high - normal * half_width,
+        center + axis * high + normal * half_width,
+        center + axis * low + normal * half_width,
+    ], dtype=np.float32)
+    return StripDetection(
+        color=model.name,
+        confidence=confidence,
+        score=score,
+        corners=corners,
+        dot_count=len(selected),
+        length=length,
+        residual=residual,
+        spacing_cv=spacing_cv,
+        line_quality=line_quality,
+        dot_quality=dot_quality,
+        periodic_quality=periodic_quality,
+        color_quality=color_quality,
+        valley_quality=reported_valley_quality,
+        peak_centers=selected,
+        mode='fast',
+        geometry_score=geometry_score,
+        class_distance=class_distance,
+        class_margin=class_margin,
+        color_support=color_support,
+        chroma=(float(candidate_chroma[0]), float(candidate_chroma[1])),
+    )
+
+
+def _detect_fast_proposals(
+        bgr: np.ndarray,
+        config: DetectorConfig) -> List[StripDetection]:
+    work, scale = _resize_for_fast_path(bgr, config)
+    fast_config = _scaled_fast_config(config, scale)
+    value_image = None
+    if fast_config.fast_check_valley:
+        value_image = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)[:, :, 2].astype(
+            np.float32)
+    points = _extract_fast_light_points(work, fast_config)
+    groups: Dict[str, List[_LightPoint]] = {
+        model.name: [] for model in fast_config.colors}
+    for point in points:
+        model, _, _ = _classify_chroma(point.chroma, fast_config, point.hue)
+        if model is not None:
+            groups[model.name].append(point)
+    raw: List[StripDetection] = []
+    if fast_config.fast_global_search:
+        # 默认关闭：天花板灯阵等 NONE 场景也可能形成颜色无关的共线亮点。
+        for indexes in _line_hypotheses(points, fast_config):
+            candidate = _fit_fast_candidate(
+                points, indexes, fast_config, None, value_image)
+            if candidate is not None:
+                raw.append(candidate)
+    for model in fast_config.colors:
+        color_points = groups[model.name][:fast_config.fast_max_points_per_color]
+        if len(color_points) < fast_config.min_dots:
+            continue
+        for indexes in _line_hypotheses(color_points, fast_config):
+            candidate = _fit_fast_candidate(
+                color_points, indexes, fast_config, model, value_image)
+            if candidate is not None:
+                raw.append(candidate)
+    proposals = _suppress_duplicate_proposals(raw)
+    if scale < 0.999:
+        inverse = 1.0 / scale
+        proposals = [item.scaled(inverse) for item in proposals]
+    return proposals
+
+
+def _search_configs(
+        config: DetectorConfig,
+        allow_fallback: bool = True) -> Sequence[DetectorConfig]:
+    rows = [config]
+    if allow_fallback and (
+            config.fallback_max_pair_hypotheses >
+            config.max_pair_hypotheses or
+            config.fallback_max_line_hypotheses >
+            config.max_line_hypotheses):
+        rows.append(replace(
+            config,
+            max_pair_hypotheses=max(
+                config.max_pair_hypotheses,
+                config.fallback_max_pair_hypotheses),
+            max_line_hypotheses=max(
+                config.max_line_hypotheses,
+                config.fallback_max_line_hypotheses),
+        ))
+    return rows
+
+
+def detect_geometry_proposals(
+        bgr: np.ndarray,
+        config: DetectorConfig) -> List[StripDetection]:
+    """返回不依赖颜色类别的灯珠排列候选，供标定流程使用。"""
+    if bgr is None or bgr.size == 0:
+        return []
+    dog, points = _prepare_light_points(bgr, config)
+    allow_fallback = sum(
+        point.quality >= 0.50 for point in points) >= 24
+    raw: List[StripDetection] = []
+    for search_config in _search_configs(config, allow_fallback):
+        attempt: List[StripDetection] = []
+        for indexes in _line_hypotheses(points, search_config):
+            candidate = _fit_candidate(
+                points, indexes, dog, config, None)
+            if candidate is None:
+                continue
+            if candidate.dot_quality < config.min_periodic_dot_quality:
+                continue
+            if candidate.color_quality < config.min_periodic_color_quality:
+                continue
+            if candidate.geometry_score < config.min_geometry_score:
+                continue
+            attempt.append(candidate)
+        if attempt:
+            raw.extend(attempt)
+            break
+    return _suppress_duplicate_proposals(raw)
+
+
+def detect_proposals(
+        bgr: np.ndarray,
+        config: DetectorConfig) -> List[StripDetection]:
+    """返回应用最终分数阈值前、颜色和结构均有效的候选。"""
+    if bgr is None or bgr.size == 0:
+        return []
+    fast = _detect_fast_proposals(bgr, config)
+    if fast or not config.fast_enable_fallback:
+        return fast
+
+    dog, points = _prepare_light_points(bgr, config)
+    allow_fallback = sum(
+        point.quality >= 0.50 for point in points) >= 24
+    groups: Dict[str, List[_LightPoint]] = {
+        model.name: [] for model in config.colors}
+    for point in points:
+        model, _, _ = _classify_chroma(point.chroma, config)
+        if model is not None:
+            groups[model.name].append(point)
+
+    raw: List[StripDetection] = []
+    # 单色训练画面和被局部过曝切碎的灯带，先按完整几何链拟合，再整体分类。
+    # 若真实画面包含两段不同颜色，合并链的色度通常落在类别间隙并会被开放集规则拒绝。
+    for search_config in _search_configs(config, allow_fallback):
+        attempt: List[StripDetection] = []
+        for indexes in _line_hypotheses(points, search_config):
+            geometry = _fit_candidate(
+                points, indexes, dog, config, None)
+            if geometry is None:
+                continue
+            if geometry.dot_quality < config.min_periodic_dot_quality:
+                continue
+            if geometry.color_quality < config.min_periodic_color_quality:
+                continue
+            if geometry.geometry_score < config.min_geometry_score:
+                continue
+            classified = _classify_geometry_candidate(
+                bgr, geometry, config)
+            if classified is not None:
+                attempt.append(classified)
+        if attempt:
+            raw.extend(attempt)
+            break
+
+    # 同时按逐灯珠类别建立候选，保证双色通信中的两段不会被合并。
+    for model in config.colors:
+        color_points = groups[model.name]
+        for search_config in _search_configs(config, allow_fallback):
+            attempt = []
+            for indexes in _line_hypotheses(color_points, search_config):
+                candidate = _fit_candidate(
+                    color_points, indexes, dog, config, model)
+                if candidate is None:
+                    continue
+                if candidate.dot_quality < config.min_periodic_dot_quality:
+                    continue
+                if candidate.color_quality < config.min_periodic_color_quality:
+                    continue
+                if candidate.geometry_score < config.min_geometry_score:
+                    continue
+                attempt.append(candidate)
+            if attempt:
+                raw.extend(attempt)
+                break
+    return _suppress_duplicate_proposals(raw)
 
 
 def detect_candidates(
@@ -1027,6 +1625,10 @@ def detection_metrics(item: StripDetection) -> Mapping[str, float]:
         'periodic': item.periodic_quality,
         'color': item.color_quality,
         'valley': item.valley_quality,
+        'geometry': item.geometry_score,
+        'class_distance': item.class_distance,
+        'class_margin': item.class_margin,
+        'color_support': item.color_support,
     }
 
 
@@ -1048,8 +1650,9 @@ def annotate(
             f'#{rank} {candidate.color} score={candidate.score:.3f} '
             f'conf={candidate.confidence:.3f} dots={candidate.dot_count} '
             f'{candidate.mode[0].upper()} '
-            f'P={candidate.periodic_quality:.2f} '
-            f'V={candidate.valley_quality:.2f}')
+            f'D={candidate.class_distance:.2f} '
+            f'M={candidate.class_margin:.2f} '
+            f'G={candidate.geometry_score:.2f}')
         cv2.putText(
             output, text, anchor, cv2.FONT_HERSHEY_SIMPLEX,
             0.48, draw_color, 2)

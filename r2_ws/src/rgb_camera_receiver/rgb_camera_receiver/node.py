@@ -1,21 +1,20 @@
-import glob
 import os
-import subprocess
 import time
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, List, Optional
+from typing import Deque, Optional
 
 import cv2
 import rclpy
-from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from std_msgs.msg import Int32
 
 from rgb_comm_protocol import FixedColorProtocol
 
-from .classifier import annotate, detect_candidates, load_config, select_winner
+from .detectors import create_detector_backend
+from .image_sources import OpenCvImageSource
+from .profiles import detector_config_path, require_calibrated_detector
 from .protocol_decoder import (
     annotate_protocol,
     decode_protocol_candidates,
@@ -29,6 +28,21 @@ class LedStripReceiver(Node):
 
     def __init__(self) -> None:
         super().__init__('rgb_camera_receiver')
+        profile = str(self.declare_parameter(
+            'camera_profile', 'usb_rgb').value).strip()
+        input_type = str(self.declare_parameter(
+            'input_type', 'v4l2').value).strip()
+        detector_enabled = bool(self.declare_parameter(
+            'detector_enabled', True).value)
+        detector_backend = str(self.declare_parameter(
+            'detector_backend', 'classical').value).strip()
+        if not detector_enabled:
+            raise RuntimeError(
+                f'camera profile {profile} is not calibrated for detection')
+        if input_type != 'v4l2':
+            raise RuntimeError(
+                f'camera profile {profile} uses unsupported detection input '
+                f'{input_type}; use tools/capture_camera_dataset.py to collect data')
         requested = str(self.declare_parameter('camera_device', 'auto').value)
         width = int(self.declare_parameter('frame_width', 1280).value)
         height = int(self.declare_parameter('frame_height', 720).value)
@@ -43,7 +57,7 @@ class LedStripReceiver(Node):
             self.declare_parameter('save_positive_images', True).value)
         capture_dir = str(self.declare_parameter(
             'positive_capture_dir',
-            '~/Desktop/LED/camera_capture_positive').value)
+            f'~/Desktop/LED/camera_data/{profile}/positive_review').value)
         self.positive_capture_dir = Path(capture_dir).expanduser()
         self.positive_save_interval = max(float(self.declare_parameter(
             'positive_save_interval_sec', 1.0).value), 0.0)
@@ -56,12 +70,20 @@ class LedStripReceiver(Node):
         self.reject_keywords = tuple(
             item.strip().lower() for item in reject.split(',') if item.strip())
         controls = str(self.declare_parameter('v4l2_controls', '').value)
-        default_config = str(
-            Path(get_package_share_directory('rgb_camera_receiver')) /
-            'config' / 'detector.yaml')
+        default_config = str(detector_config_path(profile))
         config_path = str(self.declare_parameter(
             'detector_config', default_config).value) or default_config
-        self.config = load_config(config_path)
+        detector_metadata = require_calibrated_detector(
+            Path(config_path), profile)
+        configured_algorithm = str(
+            detector_metadata.get('algorithm', '')).strip()
+        if configured_algorithm != detector_backend:
+            raise RuntimeError(
+                f'camera profile {profile} selects backend {detector_backend}, '
+                f'but detector config declares {configured_algorithm}')
+        self.detector = create_detector_backend(
+            detector_backend, Path(config_path))
+        self.config = self.detector.config
         protocol_config = str(self.declare_parameter(
             'protocol_config', '').value)
         self.protocol = FixedColorProtocol(
@@ -83,8 +105,11 @@ class LedStripReceiver(Node):
         self.history: Deque[int] = deque(maxlen=self.confirmation_window)
         self.locked = False
         self.last_protocol_seen_time: Optional[float] = None
-        self.capture, self.device = self._open_camera(requested, width, height, fps)
-        self._apply_controls(self.device, controls)
+        self.image_source = OpenCvImageSource(
+            requested, width, height, fps, self.reject_keywords, controls)
+        self.device = self.image_source.description
+        for warning in self.image_source.warnings:
+            self.get_logger().warning(warning)
         self.last_label = ''
         self.create_timer(1.0 / fps, self._scan)
         self.get_logger().info(
@@ -94,7 +119,7 @@ class LedStripReceiver(Node):
             f'{self.confirmation_window}')
 
     def _scan(self) -> None:
-        ok, frame = self.capture.read()
+        ok, frame = self.image_source.read()
         if not ok or frame is None:
             self.get_logger().warning('camera frame unavailable')
             return
@@ -102,11 +127,11 @@ class LedStripReceiver(Node):
         scale = self.processing_scale
         if scale < 1.0:
             work = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        candidates = detect_candidates(work, self.config)
+        candidates = self.detector.detect(work)
         if scale < 1.0:
             inverse = 1.0 / scale
             candidates = [item.scaled(inverse) for item in candidates]
-        single_winner = select_winner(candidates, self.config)
+        single_winner = self.detector.select(candidates)
         protocol_candidates = decode_protocol_candidates(
             candidates, self.protocol, self.pairing_config)
         protocol_winner = select_protocol_winner(
@@ -143,7 +168,7 @@ class LedStripReceiver(Node):
                     f'state={"LOCK" if self.locked else "WAIT"}')
             self.last_label = label
         if self.preview:
-            rendered = annotate(frame, candidates, single_winner)
+            rendered = self.detector.render(frame, candidates, single_winner)
             rendered = annotate_protocol(
                 rendered,
                 protocol_candidates,
@@ -215,65 +240,8 @@ class LedStripReceiver(Node):
         else:
             self.get_logger().error(f'failed to save positive frame: {path}')
 
-    def _open_camera(self, requested: str, width: int, height: int, fps: float):
-        failures: List[str] = []
-        for device in self._camera_candidates(requested):
-            capture = cv2.VideoCapture(device, cv2.CAP_V4L2)
-            if not capture.isOpened():
-                failures.append(device)
-                capture.release()
-                continue
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            capture.set(cv2.CAP_PROP_FPS, fps)
-            ok, frame = capture.read()
-            if ok and frame is not None and frame.ndim == 3 and frame.shape[2] == 3:
-                return capture, device
-            failures.append(device)
-            capture.release()
-        raise RuntimeError(
-            f'cannot open camera {requested}; attempted={failures}')
-
-    def _camera_candidates(self, requested: str) -> List[str]:
-        if requested != 'auto':
-            return [requested]
-        devices = sorted(glob.glob('/dev/v4l/by-id/*')) + sorted(glob.glob('/dev/video*'))
-        result = []
-        seen = set()
-        for device in devices:
-            resolved = os.path.realpath(device)
-            base = os.path.basename(resolved)
-            name_path = Path('/sys/class/video4linux') / base / 'name'
-            name = name_path.read_text(errors='replace').strip() if name_path.exists() else ''
-            if any(keyword in name.lower() for keyword in self.reject_keywords):
-                continue
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            result.append(device)
-        return result
-
-    def _apply_controls(self, device: str, controls: str) -> None:
-        if not controls.strip():
-            return
-        executable = '/usr/bin/v4l2-ctl' if Path('/usr/bin/v4l2-ctl').exists() else None
-        if executable is None:
-            self.get_logger().warning('v4l2-ctl not installed; camera controls skipped')
-            return
-        for assignment in controls.split(','):
-            assignment = assignment.strip()
-            if not assignment:
-                continue
-            result = subprocess.run(
-                [executable, '--device', device, '--set-ctrl', assignment],
-                text=True, capture_output=True, check=False)
-            if result.returncode != 0:
-                message = (result.stderr or result.stdout).strip()
-                self.get_logger().warning(
-                    f'camera control {assignment} failed: {message}')
-
     def destroy_node(self):
-        self.capture.release()
+        self.image_source.close()
         if self.preview:
             cv2.destroyAllWindows()
         return super().destroy_node()

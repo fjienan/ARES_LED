@@ -1,0 +1,10 @@
+source_type: v4l2
+device: auto
+reject_keywords: [Integrated, Chicony, Built-in, Internal]
+width: 1280
+height: 720
+fps: 30.0
+# 训练采集应与 receiver.yaml 使用相同的曝光、白平衡等设置。
+v4l2_controls: ""
+interval_sec: 3.0
+jpeg_quality: 95

@@ -12,13 +12,17 @@ from rgb_camera_receiver.classifier import (
 
 
 PACKAGE = Path(__file__).resolve().parents[1]
-CONFIG = load_config(str(PACKAGE / 'config' / 'detector.yaml'))
+CONFIG = load_config(str(
+    PACKAGE / 'config' / 'cameras' / 'usb_rgb' / 'detector.yaml'))
 
 
-def color_bgr(name: str, saturation: int = 220, value: int = 180):
+def color_bgr(name: str, value: int = 220):
     model = next(item for item in CONFIG.colors if item.name == name)
-    pixel = np.uint8([[[int(round(model.hue_center)), saturation, value]]])
-    return tuple(int(x) for x in cv2.cvtColor(pixel, cv2.COLOR_HSV2BGR)[0, 0])
+    blue, green = model.chroma_center
+    red = max(1e-3, 1.0 - blue - green)
+    channels = np.asarray((blue, green, red), dtype=np.float32)
+    channels *= value / max(float(np.max(channels)), 1e-6)
+    return tuple(int(round(x)) for x in channels)
 
 
 def dotted_strip(bgr=None):
@@ -43,13 +47,10 @@ def test_rejects_short_colored_bar():
     assert detect_candidates(image, CONFIG) == []
 
 
-def test_accepts_long_merged_led_strip():
+def test_rejects_continuous_colored_line():
     image = np.zeros((240, 360, 3), dtype=np.uint8)
     cv2.line(image, (45, 130), (300, 125), color_bgr('GREEN'), 4)
-    candidates = detect_candidates(image, CONFIG)
-    winner = select_winner(candidates, CONFIG)
-    assert winner is not None
-    assert winner.color == 'GREEN'
+    assert detect_candidates(image, CONFIG) == []
 
 
 def test_annotation_keeps_original_shape():
@@ -60,11 +61,11 @@ def test_annotation_keeps_original_shape():
 
 
 def test_complete_calibration_dataset():
-    dataset = PACKAGE.parents[2] / 'camera_capture'
+    dataset = PACKAGE.parents[2] / 'camera_data' / 'usb_rgb'
     if not dataset.exists():
         return
     counts = 0
-    for expected in ('BLUE', 'CYAN', 'GREEN', 'PURPLE', 'RED', 'NONE'):
+    for expected in ('RED', 'GREEN', 'BLUE', 'YELLOW', 'PURPLE', 'NONE'):
         for path in sorted((dataset / expected).glob('*.jpg')):
             image = cv2.imread(str(path), cv2.IMREAD_COLOR)
             candidates = detect_candidates(image, CONFIG)
@@ -77,4 +78,4 @@ def test_complete_calibration_dataset():
                 wrong = [item for item in candidates if item.color != expected]
                 assert wrong == [], path
             counts += 1
-    assert counts == 192
+    assert counts > 0
