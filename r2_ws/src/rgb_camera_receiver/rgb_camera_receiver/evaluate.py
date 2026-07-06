@@ -4,7 +4,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import cv2
 
@@ -14,6 +14,14 @@ from .classifier import (
     detection_metrics,
     load_config,
     select_winner,
+)
+from .profiles import (
+    CAMERA_PROFILES,
+    DEFAULT_CAMERA_PROFILE,
+    dataset_path,
+    detector_config_path,
+    require_calibrated_detector,
+    results_path,
 )
 
 
@@ -32,18 +40,51 @@ def _different_color_margin(candidates) -> float:
     return candidates[0].score / max(different.score, 1e-9)
 
 
-def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
+def _evaluation_passed(
+        failures: int,
+        separation_passed: bool,
+        p95_ms: float,
+        none_validation: str) -> bool:
+    """只有经过有效负样本验证的检测器才能通过验收。"""
+    return (
+        failures == 0 and separation_passed and p95_ms < 60.0 and
+        none_validation == 'passed'
+    )
+
+
+def _detect_with_scale(image, config, processing_scale: float):
+    work = image
+    if processing_scale < 1.0:
+        work = cv2.resize(
+            image, None, fx=processing_scale, fy=processing_scale,
+            interpolation=cv2.INTER_AREA)
+    proposals = detect_proposals(work, config)
+    if processing_scale < 1.0:
+        inverse = 1.0 / processing_scale
+        proposals = [item.scaled(inverse) for item in proposals]
+    return proposals
+
+
+def evaluate(
+        dataset: Path,
+        output: Path,
+        config_path: Path,
+        processing_scale: float = 1.0) -> int:
     config = load_config(str(config_path))
+    processing_scale = max(0.1, min(float(processing_scale), 1.0))
     records: List[Dict] = []
     durations = []
+    class_counts = {name: len(list((dataset / name).glob('*.jpg')))
+                    for name in CLASSES}
     for expected in CLASSES:
         for image_path in sorted((dataset / expected).glob('*.jpg')):
             image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image is None:
                 raise RuntimeError(f'cannot read {image_path}')
             started = time.perf_counter()
-            proposals = detect_proposals(image, config)
-            durations.append(time.perf_counter() - started)
+            proposals = _detect_with_scale(image, config, processing_scale)
+            duration = time.perf_counter() - started
+            durations.append(duration)
             candidates = [
                 item for item in proposals if item.score >= config.min_score
             ]
@@ -55,6 +96,7 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
                 'candidates': candidates,
                 'winner': winner,
                 'margin': _different_color_margin(candidates),
+                'processing_ms': duration * 1000.0,
             })
 
     true_scores = [
@@ -76,7 +118,15 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
     score_separation = (
         min_true_score / max_false_score
         if max_false_score > 0.0 else math.inf)
-    separation_passed = score_separation >= 2.0
+    separation_passed = score_separation >= 3.0
+    none_images = class_counts.get('NONE', 0)
+    none_zero_candidates = all(
+        not row['candidates'] for row in records
+        if row['expected'] == 'NONE')
+    none_validation = (
+        'passed' if none_images > 0 and none_zero_candidates else
+        'failed' if none_images > 0 else
+        'not_accepted_no_negative_samples')
 
     output.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -126,7 +176,16 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
             'passed': passed,
             'candidate_count': len(candidates),
             'proposal_count': len(record['proposals']),
+            'processing_ms': round(record['processing_ms'], 3),
             'winner_margin': record['margin'],
+            'winner_score': None if winner is None else round(winner.score, 6),
+            'candidate_scores': [
+                {
+                    'color': item.color,
+                    'score': round(item.score, 6),
+                }
+                for item in candidates
+            ],
             'proposals': proposal_data,
         })
 
@@ -140,16 +199,23 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
         if sorted_durations else 0.0)
     summary = {
         'dataset': str(dataset),
+        'config': str(config_path),
+        'processing_scale': processing_scale,
         'images': len(rows),
+        'class_counts': class_counts,
         'passed': len(rows) - failures,
         'failed': failures,
         'min_true_score': min_true_score,
         'max_false_score': max_false_score,
         'score_separation': score_separation,
-        'required_score_separation': 2.0,
+        'required_score_separation': 3.0,
         'separation_passed': separation_passed,
+        'none_validation': none_validation,
         'median_processing_ms': median_ms,
         'p95_processing_ms': p95_ms,
+        'processing_target_p95_ms': 50.0,
+        'processing_required_p95_ms': 60.0,
+        'processing_required_passed': p95_ms < 60.0,
         'results': rows,
     }
     with (output / 'results.json').open('w', encoding='utf-8') as stream:
@@ -158,39 +224,90 @@ def evaluate(dataset: Path, output: Path, config_path: Path) -> int:
             'w', newline='', encoding='utf-8') as stream:
         writer = csv.DictWriter(stream, fieldnames=(
             'image', 'expected', 'actual', 'passed', 'candidate_count',
-            'proposal_count', 'winner_margin', 'proposals'))
+            'proposal_count', 'processing_ms', 'winner_margin',
+            'winner_score', 'candidate_scores', 'proposals'))
         writer.writeheader()
         for row in rows:
             flat = dict(row)
             flat['proposals'] = json.dumps(
                 row['proposals'], ensure_ascii=False)
+            flat['candidate_scores'] = json.dumps(
+                row['candidate_scores'], ensure_ascii=False)
             writer.writerow(flat)
     print(
         f'evaluated={len(rows)} passed={len(rows)-failures} failed={failures} '
+        f'scale={processing_scale:.2f} '
         f'min_true={min_true_score:.6f} max_false={max_false_score:.6f} '
         f'separation={score_separation:.3f} separation_ok={separation_passed} '
+        f'none_validation={none_validation} '
         f'median_ms={median_ms:.1f} p95_ms={p95_ms:.1f} output={output}')
-    return 0 if failures == 0 and separation_passed else 1
+    return 0 if _evaluation_passed(
+        failures, separation_passed, p95_ms, none_validation) else 1
+
+
+def _scale_output(output: Path, scale: float, multiple: bool) -> Path:
+    if not multiple:
+        return output
+    return output / f'scale_{scale:.2f}'.replace('.', '_')
+
+
+def evaluate_scales(
+        dataset: Path,
+        output: Path,
+        config_path: Path,
+        processing_scales: Sequence[float]) -> int:
+    scales = []
+    for scale in processing_scales:
+        normalized = max(0.1, min(float(scale), 1.0))
+        if normalized not in scales:
+            scales.append(normalized)
+    multiple = len(scales) > 1
+    results = [
+        evaluate(dataset, _scale_output(output, scale, multiple), config_path, scale)
+        for scale in scales
+    ]
+    return 0 if any(code == 0 for code in results) else 1
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Evaluate and annotate the R2 LED dataset')
-    package = Path(__file__).resolve().parents[1]
+    parser.add_argument(
+        '--camera-profile',
+        choices=CAMERA_PROFILES,
+        default=DEFAULT_CAMERA_PROFILE,
+        help='选择独立的数据集和 detector 配置。')
     parser.add_argument(
         '--dataset', type=Path,
-        default=package.parents[3] / 'camera_capture')
+        help='覆盖默认数据集路径；默认 camera_data/<camera-profile>。')
     parser.add_argument(
         '--output', type=Path,
-        default=package.parents[3] / 'camera_capture_results')
+        help='覆盖默认输出路径；默认 camera_results/<camera-profile>。')
     parser.add_argument(
         '--config', type=Path,
-        default=package / 'config' / 'detector.yaml')
+        help='覆盖默认 detector；默认 config/cameras/<camera-profile>/detector.yaml。')
+    parser.add_argument(
+        '--processing-scale', type=float,
+        help='离线评估缩放比例；默认使用 detector.yaml processing.scale 或 1.0。')
+    parser.add_argument(
+        '--scan-processing-scales', action='store_true',
+        help='同时评估 1.0、0.75、0.67 三个缩放比例。')
     args = parser.parse_args()
-    raise SystemExit(evaluate(
-        args.dataset.resolve(),
-        args.output.resolve(),
-        args.config.resolve()))
+    dataset = args.dataset or dataset_path(args.camera_profile)
+    output = args.output or results_path(args.camera_profile)
+    config = args.config or detector_config_path(args.camera_profile)
+    if args.config is None:
+        config = require_calibrated_detector(config, args.camera_profile)
+    loaded = load_config(str(config))
+    if args.scan_processing_scales:
+        scales = (1.0, 0.75, 0.67)
+    else:
+        scales = (args.processing_scale or loaded.processing_scale,)
+    raise SystemExit(evaluate_scales(
+        dataset.resolve(),
+        output.resolve(),
+        config.resolve(),
+        scales))
 
 
 if __name__ == '__main__':

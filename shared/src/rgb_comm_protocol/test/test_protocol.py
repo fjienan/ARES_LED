@@ -1,4 +1,5 @@
 from rgb_comm_protocol import FixedColorProtocol
+import pytest
 
 
 def test_all_commands_round_trip():
@@ -28,3 +29,16 @@ def test_unknown_values_are_rejected():
     protocol = FixedColorProtocol()
     assert protocol.encode_symbols(99) is None
     assert protocol.decode(('CYAN', 'PURPLE')) is None
+
+
+def test_reversed_commands_are_rejected_as_conflicts(tmp_path):
+    config = tmp_path / 'protocol.yaml'
+    config.write_text(
+        'commands:\n'
+        '  1: [RED, BLUE]\n'
+        '  2: [BLUE, RED]\n',
+        encoding='utf-8',
+    )
+
+    with pytest.raises(ValueError, match='conflict under reversal'):
+        FixedColorProtocol(config_path=str(config))

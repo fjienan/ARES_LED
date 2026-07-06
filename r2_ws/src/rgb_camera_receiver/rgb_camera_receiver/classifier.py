@@ -21,11 +21,14 @@ class ColorModel:
     hue_radius: float
     min_saturation: float
     min_value: float
+    channel_min: Mapping[str, float] = None
+    channel_max: Mapping[str, float] = None
 
 
 @dataclass(frozen=True)
 class DetectorConfig:
     colors: Tuple[ColorModel, ...]
+    processing_scale: float = 1.0
     min_blob_area: int = 1
     max_blob_area: int = 300
     max_blob_aspect: float = 3.5
@@ -132,6 +135,14 @@ def load_config(path: str) -> DetectorConfig:
             hue_radius=float(values['hue_radius']),
             min_saturation=float(values.get('min_saturation', 80)),
             min_value=float(values.get('min_value', 60)),
+            channel_min={
+                str(channel).lower(): float(value)
+                for channel, value in values.get('channel_min', {}).items()
+            },
+            channel_max={
+                str(channel).lower(): float(value)
+                for channel, value in values.get('channel_max', {}).items()
+            },
         )
         for name, values in color_rows.items()
     )
@@ -140,8 +151,12 @@ def load_config(path: str) -> DetectorConfig:
     dots = raw.get('dots', {})
     geometry = raw.get('geometry', {})
     selection = raw.get('selection', {})
+    processing = raw.get('processing', {})
     return DetectorConfig(
         colors=colors,
+        processing_scale=float(np.clip(
+            processing.get('scale', raw.get('processing_scale', 1.0)),
+            0.1, 1.0)),
         min_blob_area=int(dots.get('min_blob_area', 1)),
         max_blob_area=int(dots.get('max_blob_area', 300)),
         max_blob_aspect=float(dots.get('max_blob_aspect', 3.5)),
@@ -183,7 +198,73 @@ def _hue_distance(hue: np.ndarray, center: float) -> np.ndarray:
     return np.minimum(delta, 180.0 - delta)
 
 
-def color_masks(hsv: np.ndarray, config: DetectorConfig) -> Dict[str, np.ndarray]:
+def _normalized_channels(bgr: np.ndarray) -> Dict[str, np.ndarray]:
+    values = bgr.astype(np.float32)
+    total = np.maximum(np.sum(values, axis=2), 1.0)
+    return {
+        'b': values[:, :, 0] / total,
+        'g': values[:, :, 1] / total,
+        'r': values[:, :, 2] / total,
+    }
+
+
+def _channel_constraints_mask(
+        bgr: np.ndarray,
+        model: ColorModel) -> np.ndarray:
+    if not model.channel_min and not model.channel_max:
+        return np.ones(bgr.shape[:2], dtype=bool)
+    channels = _normalized_channels(bgr)
+    mask = np.ones(bgr.shape[:2], dtype=bool)
+    for name, minimum in (model.channel_min or {}).items():
+        if name not in channels:
+            continue
+        mask &= channels[name] >= minimum
+    for name, maximum in (model.channel_max or {}).items():
+        if name not in channels:
+            continue
+        mask &= channels[name] <= maximum
+    return mask
+
+
+def _channel_constraints_quality(
+        bgr_pixels: np.ndarray,
+        model: ColorModel) -> float:
+    if not model.channel_min and not model.channel_max:
+        return 1.0
+    if len(bgr_pixels) == 0:
+        return 0.0
+    values = bgr_pixels.astype(np.float32)
+    total = np.maximum(np.sum(values, axis=1), 1.0)
+    channels = {
+        'b': values[:, 0] / total,
+        'g': values[:, 1] / total,
+        'r': values[:, 2] / total,
+    }
+    ok = np.ones(len(values), dtype=bool)
+    margins = []
+    for name, minimum in (model.channel_min or {}).items():
+        if name not in channels:
+            continue
+        channel = channels[name]
+        ok &= channel >= minimum
+        margins.append(np.clip((channel - minimum) / 0.08, 0.0, 1.0))
+    for name, maximum in (model.channel_max or {}).items():
+        if name not in channels:
+            continue
+        channel = channels[name]
+        ok &= channel <= maximum
+        margins.append(np.clip((maximum - channel) / 0.08, 0.0, 1.0))
+    if not margins:
+        return 1.0
+    pass_fraction = float(np.count_nonzero(ok)) / len(ok)
+    margin_quality = float(np.median(np.min(np.stack(margins, axis=1), axis=1)))
+    return float(np.clip(0.65 * pass_fraction + 0.35 * margin_quality, 0.0, 1.0))
+
+
+def color_masks(
+        hsv: np.ndarray,
+        bgr: np.ndarray,
+        config: DetectorConfig) -> Dict[str, np.ndarray]:
     hue_axis = np.arange(180, dtype=np.float32)
     normalized_distances = np.stack([
         _hue_distance(hue_axis, model.hue_center) /
@@ -218,12 +299,17 @@ def color_masks(hsv: np.ndarray, config: DetectorConfig) -> Dict[str, np.ndarray
             mask = cv2.inRange(
                 hsv, (int(np.ceil(low)), saturation, value),
                 (int(np.floor(high)), 255, 255))
-        masks[model.name] = mask.astype(bool) & (hue_owner == model_index)
+        masks[model.name] = (
+            mask.astype(bool) &
+            (hue_owner == model_index) &
+            _channel_constraints_mask(bgr, model)
+        )
     return masks
 
 
 def _point_color_quality(
         hsv: np.ndarray,
+        bgr: np.ndarray,
         center: np.ndarray,
         model: ColorModel,
         all_colors: Sequence[ColorModel],
@@ -234,6 +320,7 @@ def _point_color_quality(
     x0, x1 = max(0, x - radius), min(width, x + radius + 1)
     y0, y1 = max(0, y - radius), min(height, y + radius + 1)
     patch = hsv[y0:y1, x0:x1]
+    bgr_patch = bgr[y0:y1, x0:x1]
     if patch.size == 0:
         return 0.0
     yy, xx = np.ogrid[y0 - y:y1 - y, x0 - x:x1 - x]
@@ -255,6 +342,9 @@ def _point_color_quality(
     own = (nearest == own_index) & (distances[:, own_index] <= 1.0)
     if not np.any(own):
         return 0.0
+    channel_quality = _channel_constraints_quality(bgr_patch[disk][own], model)
+    if channel_quality <= 0.0:
+        return 0.0
     hue_quality = 1.0 - float(np.median(
         np.clip(distances[own, own_index], 0.0, 1.0)))
     purity = float(np.count_nonzero(own)) / len(saturated)
@@ -265,12 +355,14 @@ def _point_color_quality(
         1.0, float(np.median(saturated[own, 1])) / 180.0)
     return float(np.clip(
         purity * colored_fraction *
-        (0.65 * hue_quality + 0.35 * saturation_quality),
+        (0.65 * hue_quality + 0.35 * saturation_quality) *
+        channel_quality,
         0.0, 1.0))
 
 
 def _extract_light_points(
         hsv: np.ndarray,
+        bgr: np.ndarray,
         mask: np.ndarray,
         smooth: np.ndarray,
         dog: np.ndarray,
@@ -311,7 +403,8 @@ def _extract_light_points(
         radius = max(1.0, float(np.sqrt(area / np.pi)))
         response = float(np.percentile(weights, 80))
         color_quality = _point_color_quality(
-            hsv, center, model, config.colors, int(np.ceil(radius + 2.0)))
+            hsv, bgr, center, model, config.colors,
+            int(np.ceil(radius + 2.0)))
         if color_quality <= 0.0:
             continue
         points.append(_LightPoint(
@@ -360,7 +453,7 @@ def _extract_light_points(
             if compactness < config.min_blob_compactness:
                 continue
             color_quality = _point_color_quality(
-                hsv, center, model, config.colors, radius)
+                hsv, bgr, center, model, config.colors, radius)
             if color_quality <= 0.0:
                 continue
             points.append(_LightPoint(
@@ -387,6 +480,7 @@ def _extract_light_points(
 
 def _extract_color_components(
         hsv: np.ndarray,
+        bgr: np.ndarray,
         mask: np.ndarray,
         model: ColorModel,
         config: DetectorConfig) -> List[_ColorComponent]:
@@ -434,8 +528,9 @@ def _extract_color_components(
             0.0, 1.0 - float(np.median(np.clip(distances, 0.0, 1.0))))
         saturation_quality = min(
             1.0, float(np.median(pixels[:, 1])) / 180.0)
+        channel_quality = _channel_constraints_quality(bgr[ys, xs], model)
         color_quality = float(np.sqrt(
-            max(hue_quality * saturation_quality, 0.0)))
+            max(hue_quality * saturation_quality * channel_quality, 0.0)))
         corners = np.array([
             center + axis * low - normal * (half_width + 1.0),
             center + axis * high - normal * (half_width + 1.0),
@@ -740,9 +835,37 @@ def _sample_image(image: np.ndarray, positions: np.ndarray) -> np.ndarray:
     return image[rounded[:, 1], rounded[:, 0]].astype(np.float32)
 
 
+def _disambiguate_green_cyan_blue(
+        color: str,
+        bgr: np.ndarray,
+        positions: np.ndarray) -> str:
+    if color not in {'GREEN', 'CYAN', 'BLUE'}:
+        return color
+    pixels = _sample_image(bgr, positions)
+    if len(pixels) == 0:
+        return color
+    total = np.maximum(np.sum(pixels, axis=1), 1.0)
+    ratios = pixels / total[:, None]
+    b_ratio, g_ratio, r_ratio = np.median(ratios, axis=0)
+    if r_ratio > 0.28:
+        return color
+    if g_ratio > b_ratio * 1.03:
+        return 'GREEN'
+    if b_ratio >= 0.55 and b_ratio > g_ratio * 1.55:
+        return 'BLUE'
+    if r_ratio >= 0.075 and b_ratio > g_ratio * 1.04:
+        return 'BLUE'
+    if r_ratio >= 0.18 and b_ratio >= g_ratio * 0.95:
+        return 'BLUE'
+    if b_ratio >= 0.36 and g_ratio >= 0.28:
+        return 'CYAN'
+    return color
+
+
 def _fit_candidate(
         points: Sequence[_LightPoint],
         indexes: np.ndarray,
+        bgr: np.ndarray,
         dog: np.ndarray,
         config: DetectorConfig,
         color: str) -> Optional[StripDetection]:
@@ -880,6 +1003,7 @@ def _fit_candidate(
         center + axis * low + normal * half_width,
     ], dtype=np.float32)
     confidence = float(np.sqrt(max(color_quality * periodic_quality, 0.0)))
+    color = _disambiguate_green_cyan_blue(color, bgr, selected)
     return StripDetection(
         color=color,
         confidence=confidence,
@@ -957,11 +1081,11 @@ def detect_proposals(
     broad = cv2.GaussianBlur(
         value, (0, 0), config.dog_sigma_large)
     dog = smooth - broad
-    masks = color_masks(hsv, config)
+    masks = color_masks(hsv, bgr, config)
     raw: List[StripDetection] = []
     for model in config.colors:
         components = _extract_color_components(
-            hsv, masks[model.name], model, config)
+            hsv, bgr, masks[model.name], model, config)
         continuous = _continuous_proposals(
             components, model.name, config)
         raw.extend(continuous)
@@ -970,7 +1094,7 @@ def detect_proposals(
         points = _component_light_points(components, dog, config)
         for indexes in _line_hypotheses(points, config):
             candidate = _fit_candidate(
-                points, indexes, dog, config, model.name)
+                points, indexes, bgr, dog, config, model.name)
             if candidate is None:
                 continue
             if candidate.dot_quality < config.min_periodic_dot_quality:
@@ -980,13 +1104,24 @@ def detect_proposals(
             if _is_short_continuous_bar(candidate, components, config):
                 continue
             raw.append(candidate)
-    raw.sort(key=lambda item: item.score, reverse=True)
+    return _deduplicate_candidates(raw)
+
+
+def _deduplicate_candidates(
+        candidates: Sequence[StripDetection]) -> List[StripDetection]:
+    """合并同一单色段的重复检测，同时保留协议所需的相邻异色段。"""
+    raw = sorted(candidates, key=lambda item: item.score, reverse=True)
     kept: List[StripDetection] = []
     for candidate in raw:
         if any(
                 _overlap(candidate, existing) >= 0.55 or
-                _same_physical_strip(candidate, existing) or
-                _same_physical_strip(existing, candidate)
+                (
+                    candidate.color == existing.color and
+                    (
+                        _same_physical_strip(candidate, existing) or
+                        _same_physical_strip(existing, candidate)
+                    )
+                )
                 for existing in kept):
             continue
         kept.append(candidate)

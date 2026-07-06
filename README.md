@@ -8,12 +8,21 @@ RED/GREEN/BLUE/CYAN/PURPLE 单色灯带候选，并将两段候选按 shared 协
 ```text
 shared/src/   公共 RGB 协议
 r1_ws/src/    R1 编码发送节点；默认通过 USB 串口发送 WLED JSON
-r2_ws/src/    USB 摄像头实时识别和离线数据集评测
+r2_ws/src/    R2 摄像头实时识别和离线数据集评测
+camera_data/  R2 训练图片；按摄像头 profile 隔离
 ```
 
 `shared/src/rgb_comm_protocol/config/rgb_protocol.yaml` 只保存命令与符号序列。
 R1 的物理 RGB 值位于 `r1_ws/src/rgb_led_sender/config/colors.yaml`；R2 的相机观测
-颜色模型位于 `r2_ws/src/rgb_camera_receiver/config/detector.yaml`，两者不得共享数值。
+颜色模型位于 `r2_ws/src/rgb_camera_receiver/config/cameras/<profile>/detector.yaml`，
+两者不得共享数值。
+
+当前 profile：
+
+| profile | 状态 | 数据目录 | detector |
+|---|---|---|---|
+| `usb_rgb` | 当前 USB 摄像头 | `camera_data/usb_rgb` | 已有 |
+| `odin1` | 预留，驱动在 `~/Desktop/odin_ros2_ws` | `camera_data/odin1` | 占位，未标定 |
 
 当前 R1 发送节点订阅 `/aruco_comm/tx_id`，通过 WLED 控制器的 USB CDC 串口直接发送
 JSON 状态帧。
@@ -148,19 +157,36 @@ ros2 launch rgb_camera_receiver r2_led_vision.launch.py
 ```
 
 `camera_device: auto` 会忽略名称包含 Integrated/Chicony 的内置摄像头，并选择首个
-能输出彩色图像的外接摄像头。相机参数在 `receiver.yaml`，R2 专用颜色及几何模型在
-`detector.yaml`；这些参数与 R1 输出 RGB 完全独立。
+能输出彩色图像的外接摄像头。默认 profile 是 `usb_rgb`。
+
+如需显式指定 profile：
+
+```bash
+ros2 launch rgb_camera_receiver r2_led_vision.launch.py camera_profile:=usb_rgb
+```
+
+Odin1 的 profile 已预留，但当前 R2 节点还没有接入 Odin1 ROS image topic 输入源；
+不要直接用 `camera_profile:=odin1` 期待它读取 Odin1 画面。每台相机的运行参数在
+`config/cameras/<profile>/receiver.yaml`，R2 专用颜色及几何模型在
+`config/cameras/<profile>/detector.yaml`；这些参数与 R1 输出 RGB 完全独立。
 
 离线处理全部标注数据并生成逐图结果：
 
 ```bash
 ros2 run rgb_camera_receiver evaluate_led_dataset \
-  --dataset ~/Desktop/LED/camera_capture \
-  --output ~/Desktop/LED/camera_capture_results
+  --camera-profile usb_rgb
 ```
 
 结果目录包含每张图片的全部候选框、颜色、置信度、排名和分差，以及 `results.csv`、
 `results.json`。退出码非零表示至少一张图片未满足验收条件。
+
+USB 摄像头重新标定：
+
+```bash
+ros2 run rgb_camera_receiver calibrate_led_colors --camera-profile usb_rgb
+```
+
+`camera_data/usb_rgb/unused/YELLOW` 中的黄色样本当前不参与默认标定和评估。
 
 ## 测试
 

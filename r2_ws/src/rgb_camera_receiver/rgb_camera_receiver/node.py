@@ -9,7 +9,6 @@ from typing import Deque, List, Optional
 
 import cv2
 import rclpy
-from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from std_msgs.msg import Int32
 
@@ -22,6 +21,12 @@ from .protocol_decoder import (
     load_pairing_config,
     select_protocol_winner,
 )
+from .profiles import (
+    DEFAULT_CAMERA_PROFILE,
+    detector_config_path,
+    require_calibrated_detector,
+    validate_camera_profile,
+)
 
 
 class LedStripReceiver(Node):
@@ -29,6 +34,8 @@ class LedStripReceiver(Node):
 
     def __init__(self) -> None:
         super().__init__('rgb_camera_receiver')
+        profile = validate_camera_profile(str(self.declare_parameter(
+            'camera_profile', DEFAULT_CAMERA_PROFILE).value))
         requested = str(self.declare_parameter('camera_device', 'auto').value)
         width = int(self.declare_parameter('frame_width', 1280).value)
         height = int(self.declare_parameter('frame_height', 720).value)
@@ -56,11 +63,12 @@ class LedStripReceiver(Node):
         self.reject_keywords = tuple(
             item.strip().lower() for item in reject.split(',') if item.strip())
         controls = str(self.declare_parameter('v4l2_controls', '').value)
-        default_config = str(
-            Path(get_package_share_directory('rgb_camera_receiver')) /
-            'config' / 'detector.yaml')
-        config_path = str(self.declare_parameter(
-            'detector_config', default_config).value) or default_config
+        default_detector = str(detector_config_path(profile))
+        configured_detector = str(self.declare_parameter(
+            'detector_config', default_detector).value).strip()
+        config_path = str(require_calibrated_detector(
+            Path(configured_detector or default_detector).expanduser(),
+            profile))
         self.config = load_config(config_path)
         protocol_config = str(self.declare_parameter(
             'protocol_config', '').value)
@@ -88,7 +96,8 @@ class LedStripReceiver(Node):
         self.last_label = ''
         self.create_timer(1.0 / fps, self._scan)
         self.get_logger().info(
-            f'R2 LED vision ready: camera={self.device}, config={config_path}, '
+            f'R2 LED vision ready: profile={profile}, camera={self.device}, '
+            f'config={config_path}, '
             f'colors={[item.name for item in self.config.colors]}, '
             f'output={output_topic}, confirm={self.confirmation_required}/'
             f'{self.confirmation_window}')
