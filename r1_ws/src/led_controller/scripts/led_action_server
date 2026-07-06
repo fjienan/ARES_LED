@@ -1,0 +1,6 @@
+#!/usr/bin/python3
+from led_controller_nodes.led_action_server import main
+
+
+if __name__ == '__main__':
+    main()

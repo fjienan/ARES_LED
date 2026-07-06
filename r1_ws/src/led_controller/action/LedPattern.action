@@ -1,0 +1,15 @@
+# Goal
+int32[] groups
+int32[] colors
+float32[] brightnesses
+float32[] blink_hz
+float32 duration
+---
+# Result
+bool success
+string message
+---
+# Feedback
+float32 percent_complete
+int32 current_step
+string message

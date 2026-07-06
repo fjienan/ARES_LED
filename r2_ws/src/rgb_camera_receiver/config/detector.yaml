@@ -1,0 +1,57 @@
+# R2 camera observations. These are intentionally independent from R1 LED RGB values.
+colors:
+  RED:    {hue_center: 2,   hue_radius: 13, min_saturation: 100, min_value: 65}
+  GREEN:  {hue_center: 74,  hue_radius: 10, min_saturation: 90,  min_value: 55}
+  CYAN:   {hue_center: 84,  hue_radius: 9,  min_saturation: 85,  min_value: 55}
+  BLUE:   {hue_center: 120, hue_radius: 15, min_saturation: 90,  min_value: 55}
+  PURPLE: {hue_center: 147, hue_radius: 14, min_saturation: 80,  min_value: 55}
+
+# A physical LED is a compact, locally bright point. These settings reject the
+# long coloured fringes produced by white ceiling lights.
+dots:
+  min_blob_area: 1
+  max_blob_area: 300
+  max_blob_aspect: 3.5
+  min_blob_compactness: 0.05
+  dog_sigma_small: 0.8
+  dog_sigma_large: 2.6
+  min_dog_response: 5.0
+  max_points_per_color: 160
+
+geometry:
+  min_dots: 6
+  min_length_pixels: 40
+  line_distance_pixels: 3.5
+  max_gap_ratio: 3.2
+  # Gaps may remain constant or increase/decrease approximately linearly under
+  # perspective. This is the normalized residual around that linear trend.
+  max_spacing_trend_error: 0.32
+  min_coverage: 0.55
+  min_valley_contrast: 0.05
+  # Weak reflections and ceiling-light fringes fail these per-bead checks.
+  min_periodic_dot_quality: 0.38
+  min_periodic_color_quality: 0.45
+  # When distance/exposure merges the beads, accept only a long and thin
+  # saturated component. Short glowing bars are not LED strips.
+  continuous_min_area: 30
+  continuous_min_length: 80
+  continuous_min_aspect: 8.0
+  continuous_min_color_quality: 0.75
+  max_pair_hypotheses: 2000
+  max_line_hypotheses: 20
+
+selection:
+  min_score: 0.04
+  winner_margin: 1.20
+
+# Pair two independently detected monochrome strips into one shared protocol
+# command. The protocol table itself lives in shared/rgb_comm_protocol.
+pairing:
+  min_pair_score: 0.04
+  max_angle_degrees: 18.0
+  max_cross_distance_pixels: 35.0
+  min_center_distance_ratio: 0.35
+  max_center_distance_ratio: 3.0
+  min_length_ratio: 0.35
+  max_length_ratio: 2.8
+  max_pairs: 20

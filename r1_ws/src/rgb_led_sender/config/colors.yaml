@@ -1,0 +1,9 @@
+# R1 physical WLED JSON RGB values. R2 camera colour models are configured separately.
+# The current WLED/strip path has green/blue swapped at the output, so these are
+# chosen by observed colour, not by nominal channel name.
+colors:
+  RED: [255, 0, 0]
+  GREEN: [0, 0, 255]
+  BLUE: [0, 255, 0]
+  CYAN: [0, 130, 255]
+  PURPLE: [255, 255, 0]

@@ -1,0 +1,80 @@
+# Codex / local agent state
+.codex/
+.agents/
+.claude/
+
+# ROS 2 / colcon generated workspaces
+build/
+install/
+log/
+build_shared/
+install_shared/
+log_shared/
+.colcon/
+
+# ROS runtime data and recordings
+.ros/
+rosbag2_*/
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+
+# Python bytecode, environments and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+camera_capture_results/
+camera_capture_positive/
+.venv/
+venv/
+env/
+
+# Packaging outputs
+dist/
+*.egg-info/
+.eggs/
+wheelhouse/
+
+# Native build/editor helper outputs
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+.cache/
+build_local/
+build_local_*/
+
+# IDE and editor-local settings
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Runtime logs and crash dumps
+*.log
+*.pid
+*.stackdump
+core
+core.*

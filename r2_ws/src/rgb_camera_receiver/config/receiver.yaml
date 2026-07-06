@@ -1,0 +1,37 @@
+rgb_camera_receiver:
+  ros__parameters:
+    # auto skips laptop integrated cameras and selects the first readable external stream.
+    camera_device: auto
+    camera_reject_keywords: Integrated,Chicony
+    frame_width: 1280
+    frame_height: 720
+    scan_rate_hz: 30.0
+
+    # Empty by default because some USB cameras expose no V4L2 controls.
+    # Format when supported: auto_exposure=1,exposure_time_absolute=100,gain=0
+    v4l2_controls: ""
+
+    show_preview: true
+    preview_scale: 0.5
+    # Dataset acceptance is calibrated at full resolution. Lower this only after
+    # verifying the offline and live results at the requested scale.
+    processing_scale: 1.0
+
+    # Save the original camera frame whenever the detector selects a positive
+    # result. The first frame of a positive run is saved immediately; while
+    # detection remains positive, subsequent frames are limited to one per second.
+    save_positive_images: true
+    positive_capture_dir: ~/Desktop/LED/camera_capture_positive
+    positive_save_interval_sec: 1.0
+
+    # Empty means the installed package's config/detector.yaml.
+    detector_config: ""
+
+    # Confirm decoded two-segment protocol commands over multiple frames before
+    # publishing. At 30 Hz, 5/7 is fast while rejecting most one-frame mistakes.
+    protocol_config: ""
+    output_topic: /aruco_comm/rx_id
+    confirmation_window: 7
+    confirmation_required: 5
+    protocol_winner_margin: 1.20
+    off_unlock_sec: 0.35

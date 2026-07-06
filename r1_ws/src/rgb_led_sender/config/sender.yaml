@@ -1,0 +1,20 @@
+rgb_led_sender:
+  ros__parameters:
+    input_topic: /aruco_comm/tx_id
+    transport: serial
+    # serial=USB CDC/WLED JSON; action=legacy ROS LedPattern action.
+    serial_device: auto
+    serial_baudrate: 115200
+    # Keep at 0.0 for normal WLED control. Query/verbose replies can fill the
+    # serial buffer and make later writes unreliable.
+    serial_timeout_sec: 0.0
+    led_action_name: /led_pattern
+    # Used by legacy action transport only. Serial/WLED uses pixel_count.
+    groups: [0, 1]
+    # Number of WS2811 addressable sections/pixels known to WLED.
+    pixel_count: 11
+    # WLED global brightness, 0..255.
+    brightness: 30.0
+    retry_period_sec: 0.5
+    # R1 physical output RGB values; unrelated to R2 camera observations.
+    colors_config: ""
