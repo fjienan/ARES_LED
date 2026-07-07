@@ -9,8 +9,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'camera_profile',
-            default_value='usb_rgb',
-            description='R2 摄像头 profile：usb_rgb 或 odin1。'),
+            default_value='usb_rgb_1',
+            description='R2 摄像头 profile：usb_rgb_1 或 usb_rgb_2。'),
         Node(
             package='rgb_camera_receiver',
             executable='rgb_camera_receiver',

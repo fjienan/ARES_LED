@@ -22,33 +22,33 @@ def load_yaml(path: Path):
 def test_detector_configs_are_profile_scoped():
     assert not (CONFIG / 'detector.yaml').exists()
     assert not (CONFIG / 'receiver.yaml').exists()
-    for profile in ('usb_rgb', 'odin1'):
+    for profile in ('usb_rgb_1', 'usb_rgb_2'):
         root = CONFIG / 'cameras' / profile
         assert (root / 'receiver.yaml').is_file()
         assert (root / 'detector.yaml').is_file()
 
 
-def test_only_usb_rgb_is_calibrated_now():
-    assert load_yaml(CONFIG / 'cameras' / 'usb_rgb' / 'detector.yaml')['calibrated']
-    assert not load_yaml(CONFIG / 'cameras' / 'odin1' / 'detector.yaml')['calibrated']
+def test_only_first_usb_rgb_is_calibrated_now():
+    assert load_yaml(CONFIG / 'cameras' / 'usb_rgb_1' / 'detector.yaml')['calibrated']
+    assert not load_yaml(CONFIG / 'cameras' / 'usb_rgb_2' / 'detector.yaml')['calibrated']
 
 
 def test_profile_validation_rejects_unknown_camera():
     try:
         validate_camera_profile('unknown')
     except ValueError as error:
-        assert 'usb_rgb' in str(error)
-        assert 'odin1' in str(error)
+        assert 'usb_rgb_1' in str(error)
+        assert 'usb_rgb_2' in str(error)
     else:
         raise AssertionError('unknown camera_profile was accepted')
 
 
 def test_detector_config_path_uses_profile_directory():
-    path = detector_config_path('usb_rgb')
+    path = detector_config_path('usb_rgb_1')
     assert path.parts[-4:] == (
         'config',
         'cameras',
-        'usb_rgb',
+        'usb_rgb_1',
         'detector.yaml',
     )
 

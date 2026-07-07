@@ -5,8 +5,8 @@
 
 ```text
 camera_data/
-  usb_rgb/   当前 USB RGB 摄像头数据
-  odin1/     Odin1 预留数据目录
+  usb_rgb_1/ 第一台 USB RGB 摄像头数据
+  usb_rgb_2/ 第二台 USB RGB 摄像头数据
 ```
 
 默认参与标定和评估的类别目录为：

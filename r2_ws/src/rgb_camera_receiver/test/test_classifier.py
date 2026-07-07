@@ -15,7 +15,7 @@ from rgb_camera_receiver.classifier import (
 
 PACKAGE = Path(__file__).resolve().parents[1]
 CONFIG = load_config(str(
-    PACKAGE / 'config' / 'cameras' / 'usb_rgb' / 'detector.yaml'))
+    PACKAGE / 'config' / 'cameras' / 'usb_rgb_1' / 'detector.yaml'))
 
 
 def color_bgr(name: str, saturation: int = 220, value: int = 180):
@@ -101,7 +101,7 @@ def test_annotation_keeps_original_shape():
 
 
 def test_complete_calibration_dataset():
-    dataset = PACKAGE.parents[2] / 'camera_data' / 'usb_rgb'
+    dataset = PACKAGE.parents[2] / 'camera_data' / 'usb_rgb_1'
     if not dataset.exists():
         return
     counts = 0

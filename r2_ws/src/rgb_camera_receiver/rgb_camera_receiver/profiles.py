@@ -1,7 +1,7 @@
 """R2 摄像头 profile 路径管理。
 
 不同摄像头的成像颜色、噪声和输入方式可能完全不同，因此训练数据、识别参数和后续算法
-都按 profile 隔离。当前可用 profile 是 USB RGB 摄像头；Odin1 先预留数据和配置位置。
+都按 profile 隔离。当前只支持 USB 摄像头；两台 USB 摄像头分别使用独立数据集和配置。
 """
 
 import os
@@ -23,8 +23,8 @@ except ModuleNotFoundError:
         raise PackageNotFoundError()
 
 
-CAMERA_PROFILES: Tuple[str, ...] = ('usb_rgb', 'odin1')
-DEFAULT_CAMERA_PROFILE = 'usb_rgb'
+CAMERA_PROFILES: Tuple[str, ...] = ('usb_rgb_1', 'usb_rgb_2')
+DEFAULT_CAMERA_PROFILE = 'usb_rgb_1'
 
 
 def validate_camera_profile(profile: str) -> str:

@@ -89,8 +89,12 @@ def parse_args():
         '--device', default='auto',
         help='auto, /dev/video0, or a /dev/v4l/by-id path')
     parser.add_argument(
-        '--output', default='~/ARES_LED/camera_data/usb_rgb/raw',
-        help='directory in which JPG images are saved')
+        '--output',
+        help='directory in which JPG images are saved; '
+             'default: <repo>/camera_data/usb_rgb_1/raw')
+    parser.add_argument(
+        '--prefix', default='usb_rgb_1',
+        help='saved file prefix, e.g. usb_rgb_1 or usb_rgb_2')
     parser.add_argument(
         '--interval', type=float, default=2.0,
         help='save interval in seconds, default: 2')
@@ -111,7 +115,10 @@ def main():
     if not 1 <= args.jpeg_quality <= 100:
         raise SystemExit('--jpeg-quality must be in 1..100')
 
-    output_dir = Path(args.output).expanduser().resolve()
+    default_output = (
+        Path(__file__).resolve().parents[1] /
+        'camera_data' / 'usb_rgb_1' / 'raw')
+    output_dir = Path(args.output).expanduser().resolve() if args.output else default_output
     output_dir.mkdir(parents=True, exist_ok=True)
     capture, selected_device = open_camera(
         args.device, args.width, args.height, args.fps)
@@ -140,7 +147,7 @@ def main():
             now = time.monotonic()
             if now >= next_save:
                 stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-                path = output_dir / f'usb_rgb_{stamp}_{count:06d}.jpg'
+                path = output_dir / f'{args.prefix}_{stamp}_{count:06d}.jpg'
                 saved = cv2.imwrite(
                     str(path), frame,
                     [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])

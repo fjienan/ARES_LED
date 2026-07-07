@@ -39,7 +39,7 @@ def test_failed_self_check_does_not_overwrite_active_config(
     output.write_text('calibrated: true\nmarker: keep\n', encoding='utf-8')
     base_config = (
         Path(__file__).resolve().parents[1] /
-        'config' / 'cameras' / 'usb_rgb' / 'detector.yaml')
+        'config' / 'cameras' / 'usb_rgb_1' / 'detector.yaml')
 
     monkeypatch.setattr(
         calibration,
