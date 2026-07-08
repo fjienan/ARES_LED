@@ -20,10 +20,12 @@ from capture_usb_rgb import camera_name, open_camera, read_camera_frame
 from detect_usb_rgb_2_three_segment import (
     REPO_ROOT,
     R2_PACKAGE,
+    load_detector,
+)
+from rgb_camera_receiver.three_segment import (
     annotate_three_segments,
     detect_single_segments,
     detect_three_segments,
-    load_detector,
     merge_strong_and_weak_segments,
     weak_segments_from_masks,
 )
@@ -161,7 +163,7 @@ def main():
     print(f'detector: {config_path}')
     print(f'device: {selected_device} ({camera_name(selected_device)})')
     print(f'processing_scale: {processing_scale:g}')
-    print(f'min_three_score: {args.min_three_score:g}')
+    print(f'min_three_score: {three_args.min_three_score:g}')
     if args.no_save:
         print('positive saving: disabled')
     else:

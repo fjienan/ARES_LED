@@ -1,28 +1,30 @@
-#!/usr/bin/env python3
-"""USB RGB 2 三段四色灯带离线识别。
+"""Shared three-segment detector used by usb_rgb_2 live tools and ROS nodes."""
 
-该脚本不依赖 ROS2 和 shared 协议包。它复用 usb_rgb_2 的单段灯带检测器，
-再把单段候选组合成“三段、基本共线、相邻不同色”的灯带编码候选。
-"""
-
-import argparse
 from dataclasses import dataclass
+from functools import cmp_to_key
 from itertools import combinations
 from pathlib import Path
-import sys
-import time
 from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+import yaml
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-R2_PACKAGE = REPO_ROOT / 'r2_ws' / 'src' / 'rgb_camera_receiver'
-sys.path.insert(0, str(R2_PACKAGE))
+IMAGE_ORDER_X_TOLERANCE = 12.0
 
-from rgb_camera_receiver.classifier import classifier_for_profile  # noqa: E402
-from rgb_camera_receiver import three_segment as shared_three_segment  # noqa: E402
+
+@dataclass(frozen=True)
+class ThreeSegmentConfig:
+    max_single_candidates: int = 30
+    max_results: int = 12
+    min_three_score: float = 0.05
+    winner_margin: float = 1.2
+    max_angle_degrees: float = 18.0
+    max_cross_distance: float = 45.0
+    min_center_distance_ratio: float = 0.35
+    max_center_distance_ratio: float = 4.0
+    max_gap_ratio: float = 3.2
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,7 @@ class ThreeSegmentDetection:
     cross_distance: float
     gap_ratio: float
     length_ratio: float
+    center_distance_ratio: float
     ambiguous: bool = False
 
 
@@ -66,63 +69,23 @@ class WeakStripDetection:
     mode: str = 'weak'
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Detect three-color LED-strip codes in usb_rgb_2 images.')
-    parser.add_argument(
-        '--input',
-        default=str(REPO_ROOT / 'camera_data' / 'usb_rgb_2' / 'combined'),
-        help='输入图片目录；默认 camera_data/usb_rgb_2/combined')
-    parser.add_argument(
-        '--output',
-        default=str(
-            REPO_ROOT / 'camera_capture_results' / 'usb_rgb_2' / 'combined'),
-        help='标注图片输出目录；默认 camera_capture_results/usb_rgb_2/combined')
-    parser.add_argument(
-        '--config',
-        default=str(
-            R2_PACKAGE / 'config' / 'cameras' / 'usb_rgb_2' / 'detector.yaml'),
-        help='usb_rgb_2 detector.yaml 路径')
-    parser.add_argument(
-        '--processing-scale', type=float,
-        help='检测前缩放比例；默认读取 detector.yaml 的 processing.scale')
-    parser.add_argument(
-        '--max-single-candidates', type=int, default=30,
-        help='参与三段组合的单段候选数量上限；默认 30')
-    parser.add_argument(
-        '--max-results', type=int, default=12,
-        help='每张图最多标注的三段候选数量；默认 12')
-    parser.add_argument(
-        '--min-three-score', type=float, default=0.05,
-        help='三段候选最低总分；默认 0.05')
-    parser.add_argument(
-        '--winner-margin', type=float, default=1.2,
-        help='第一名相对第二名的最低分数比；默认 1.2')
-    parser.add_argument(
-        '--max-angle-degrees', type=float, default=18.0,
-        help='三段方向最大夹角；默认 18 度')
-    parser.add_argument(
-        '--max-cross-distance', type=float, default=45.0,
-        help='三段中心到公共直线最大横向距离，像素；默认 45')
-    parser.add_argument(
-        '--min-center-distance-ratio', type=float, default=0.35,
-        help='相邻段中心距离 / 中位段长 的下限；默认 0.35')
-    parser.add_argument(
-        '--max-center-distance-ratio', type=float, default=4.0,
-        help='相邻段中心距离 / 中位段长 的上限；默认 4.0')
-    parser.add_argument(
-        '--max-gap-ratio', type=float, default=3.2,
-        help='两段中心间距最大/最小比；默认 3.2')
-    parser.add_argument(
-        '--jpeg-quality', type=int, default=95,
-        help='输出 JPEG 质量；默认 95')
-    return parser.parse_args()
-
-
-def load_detector(config_path: Path):
-    classifier = classifier_for_profile('usb_rgb_2')
-    config = classifier.load_config(str(config_path))
-    return classifier, config
+def load_three_segment_config(path: str) -> ThreeSegmentConfig:
+    with Path(path).open('r', encoding='utf-8') as stream:
+        raw = yaml.safe_load(stream) or {}
+    row = raw.get('three_segment', {}) or {}
+    return ThreeSegmentConfig(
+        max_single_candidates=int(row.get('max_single_candidates', 30)),
+        max_results=int(row.get('max_results', 12)),
+        min_three_score=float(row.get('min_three_score', 0.05)),
+        winner_margin=float(row.get('winner_margin', 1.2)),
+        max_angle_degrees=float(row.get('max_angle_degrees', 18.0)),
+        max_cross_distance=float(row.get('max_cross_distance', 45.0)),
+        min_center_distance_ratio=float(
+            row.get('min_center_distance_ratio', 0.35)),
+        max_center_distance_ratio=float(
+            row.get('max_center_distance_ratio', 4.0)),
+        max_gap_ratio=float(row.get('max_gap_ratio', 3.2)),
+    )
 
 
 def scaled_frame(frame, scale: float):
@@ -349,12 +312,33 @@ def angle_spread_degrees(axes: Sequence[SegmentAxis]) -> float:
     return max_angle
 
 
+def image_order_indices(centers: np.ndarray, x_tolerance: float = IMAGE_ORDER_X_TOLERANCE):
+    def compare(left_index: int, right_index: int) -> int:
+        left = centers[left_index]
+        right = centers[right_index]
+        if abs(float(left[0] - right[0])) <= x_tolerance:
+            if float(left[1]) < float(right[1]):
+                return -1
+            if float(left[1]) > float(right[1]):
+                return 1
+        else:
+            if float(left[0]) < float(right[0]):
+                return -1
+            if float(left[0]) > float(right[0]):
+                return 1
+        return int(left_index) - int(right_index)
+
+    return np.array(
+        sorted(range(len(centers)), key=cmp_to_key(compare)),
+        dtype=np.int64)
+
+
 def build_three_segment_candidate(
         raw_segments: Tuple[object, object, object],
-        args) -> Optional[ThreeSegmentDetection]:
+        config: ThreeSegmentConfig) -> Optional[ThreeSegmentDetection]:
     axes = [segment_axis(item) for item in raw_segments]
     angle = angle_spread_degrees(axes)
-    if angle > args.max_angle_degrees:
+    if angle > config.max_angle_degrees:
         return None
 
     common_axis = aligned_average_axis(axes)
@@ -362,44 +346,44 @@ def build_three_segment_candidate(
     centers = np.stack([item.center for item in axes], axis=0)
     origin = np.mean(centers, axis=0)
     projections = (centers - origin) @ common_axis
-    order = np.argsort(projections)
+    order = image_order_indices(centers)
     segments = tuple(raw_segments[index] for index in order)
-    ordered_axes = [axes[index] for index in order]
     ordered_proj = projections[order]
 
     symbols = tuple(item.color for item in segments)
     if symbols[0] == symbols[1] or symbols[1] == symbols[2]:
         return None
 
-    gaps = np.diff(ordered_proj)
+    gaps = np.abs(np.diff(ordered_proj))
     if np.any(gaps <= 1e-6):
         return None
 
     lengths = np.array([item.length for item in segments], dtype=np.float32)
     median_length = max(float(np.median(lengths)), 1.0)
     gap_ratios_to_length = gaps / median_length
-    if np.any(gap_ratios_to_length < args.min_center_distance_ratio):
+    if np.any(gap_ratios_to_length < config.min_center_distance_ratio):
         return None
-    if np.any(gap_ratios_to_length > args.max_center_distance_ratio):
+    if np.any(gap_ratios_to_length > config.max_center_distance_ratio):
         return None
 
     gap_ratio = float(np.max(gaps) / max(float(np.min(gaps)), 1e-6))
-    if gap_ratio > args.max_gap_ratio:
+    if gap_ratio > config.max_gap_ratio:
         return None
 
     cross_distances = np.abs((centers - origin) @ normal)
     cross_distance = float(np.max(cross_distances))
-    if cross_distance > args.max_cross_distance:
+    if cross_distance > config.max_cross_distance:
         return None
 
     length_ratio = float(np.max(lengths) / max(float(np.min(lengths)), 1e-6))
     if length_ratio > 3.0:
         return None
 
-    angle_quality = max(0.0, 1.0 - angle / max(args.max_angle_degrees, 1e-6))
+    angle_quality = max(0.0, 1.0 - angle / max(config.max_angle_degrees, 1e-6))
     cross_quality = max(
-        0.0, 1.0 - cross_distance / max(args.max_cross_distance, 1e-6))
-    gap_quality = max(0.0, 1.0 - (gap_ratio - 1.0) / max(args.max_gap_ratio - 1.0, 1e-6))
+        0.0, 1.0 - cross_distance / max(config.max_cross_distance, 1e-6))
+    gap_quality = max(
+        0.0, 1.0 - (gap_ratio - 1.0) / max(config.max_gap_ratio - 1.0, 1e-6))
     length_quality = float(np.exp(-abs(np.log(max(length_ratio, 1e-6)))))
     distance_quality = float(np.mean([
         np.exp(-abs(np.log(max(value, 1e-6))))
@@ -418,7 +402,7 @@ def build_three_segment_candidate(
         max(segments[1].score, 0.0) *
         max(segments[2].score, 0.0)))
     score = segment_score * geometry_quality
-    if score < args.min_three_score:
+    if score < config.min_three_score:
         return None
 
     confidence = float(np.cbrt(
@@ -437,6 +421,7 @@ def build_three_segment_candidate(
         cross_distance=cross_distance,
         gap_ratio=gap_ratio,
         length_ratio=length_ratio,
+        center_distance_ratio=float(np.mean(gap_ratios_to_length)),
     )
 
 
@@ -472,18 +457,20 @@ def deduplicate_three_segment_candidates(
     return kept
 
 
-def detect_three_segments(single_candidates: Sequence[object], args):
-    limited = list(single_candidates[:max(args.max_single_candidates, 3)])
+def detect_three_segments(
+        single_candidates: Sequence[object],
+        config: ThreeSegmentConfig):
+    limited = list(single_candidates[:max(config.max_single_candidates, 3)])
     raw = []
     for triple in combinations(limited, 3):
-        candidate = build_three_segment_candidate(triple, args)
+        candidate = build_three_segment_candidate(triple, config)
         if candidate is not None:
             raw.append(candidate)
     candidates = deduplicate_three_segment_candidates(raw)
-    candidates = candidates[:max(args.max_results, 1)]
+    candidates = candidates[:max(config.max_results, 1)]
     if len(candidates) >= 2:
         margin = candidates[0].score / max(candidates[1].score, 1e-9)
-        if margin < args.winner_margin:
+        if margin < config.winner_margin:
             winner = ThreeSegmentDetection(
                 symbols=candidates[0].symbols,
                 segments=candidates[0].segments,
@@ -494,10 +481,37 @@ def detect_three_segments(single_candidates: Sequence[object], args):
                 cross_distance=candidates[0].cross_distance,
                 gap_ratio=candidates[0].gap_ratio,
                 length_ratio=candidates[0].length_ratio,
+                center_distance_ratio=candidates[0].center_distance_ratio,
                 ambiguous=True,
             )
             candidates[0] = winner
     return candidates
+
+
+def detect_three_segment_frame(
+        frame,
+        classifier,
+        detector_config,
+        processing_scale: float,
+        three_segment_config: ThreeSegmentConfig):
+    strong_candidates = detect_single_segments(
+        frame, classifier, detector_config, processing_scale)
+    weak_candidates = []
+    single_candidates = list(strong_candidates)
+    three_candidates = detect_three_segments(single_candidates, three_segment_config)
+    if not three_candidates:
+        strong_colors = {item.color for item in strong_candidates}
+        allowed_colors = {
+            item.name for item in detector_config.colors
+            if item.name not in strong_colors
+        }
+        weak_candidates = weak_segments_from_masks(
+            frame, classifier, detector_config, processing_scale, allowed_colors)
+        single_candidates = merge_strong_and_weak_segments(
+            strong_candidates, weak_candidates)
+        three_candidates = detect_three_segments(
+            single_candidates, three_segment_config)
+    return strong_candidates, weak_candidates, single_candidates, three_candidates
 
 
 def draw_label(output, text: str, anchor, color, scale=0.52, thickness=2):
@@ -560,7 +574,8 @@ def annotate_three_segments(
                 color,
                 thickness)
         middle = np.mean(np.stack(centers, axis=0), axis=0)
-        status = 'AMBIG ' if item.ambiguous else ''
+        ambiguous = bool(getattr(item, 'ambiguous', False))
+        status = 'AMBIG ' if ambiguous else ''
         text = (
             f'#{rank} {status}{"-".join(s[0] for s in item.symbols)} '
             f'score={item.score:.3f} conf={item.confidence:.2f} '
@@ -581,137 +596,7 @@ def annotate_three_segments(
         title = (
             f'SELECTED {"-".join(s[0] for s in winner.symbols)} '
             f'rev={reverse} score={winner.score:.3f}')
-        if winner.ambiguous:
+        if bool(getattr(winner, 'ambiguous', False)):
             title = 'AMBIGUOUS ' + title
     draw_label(output, title, (12, 32), (255, 255, 255), scale=0.72, thickness=2)
     return output
-
-
-def image_paths(input_dir: Path):
-    suffixes = {'.jpg', '.jpeg', '.png', '.bmp'}
-    return [
-        item for item in sorted(input_dir.iterdir())
-        if item.is_file() and item.suffix.lower() in suffixes
-    ]
-
-
-detect_single_segments = shared_three_segment.detect_single_segments
-weak_segments_from_masks = shared_three_segment.weak_segments_from_masks
-merge_strong_and_weak_segments = shared_three_segment.merge_strong_and_weak_segments
-build_three_segment_candidate = shared_three_segment.build_three_segment_candidate
-deduplicate_three_segment_candidates = (
-    shared_three_segment.deduplicate_three_segment_candidates)
-detect_three_segments = shared_three_segment.detect_three_segments
-annotate_three_segments = shared_three_segment.annotate_three_segments
-
-
-def main():
-    args = parse_args()
-    input_dir = Path(args.input).expanduser().resolve()
-    output_dir = Path(args.output).expanduser().resolve()
-    config_path = Path(args.config).expanduser().resolve()
-
-    if not input_dir.is_dir():
-        raise SystemExit(f'输入目录不存在：{input_dir}')
-    if not config_path.is_file():
-        raise SystemExit(f'配置文件不存在：{config_path}')
-    if not 1 <= args.jpeg_quality <= 100:
-        raise SystemExit('--jpeg-quality must be in 1..100')
-
-    classifier, config = load_detector(config_path)
-    processing_scale = (
-        float(args.processing_scale)
-        if args.processing_scale is not None
-        else float(getattr(config, 'processing_scale', 1.0))
-    )
-    processing_scale = min(1.0, max(processing_scale, 0.1))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    paths = image_paths(input_dir)
-    if not paths:
-        raise SystemExit(f'输入目录没有图片：{input_dir}')
-
-    timings = []
-    detected = 0
-    ambiguous = 0
-    rows = []
-
-    print(f'input: {input_dir}')
-    print(f'output: {output_dir}')
-    print(f'config: {config_path}')
-    print(f'processing_scale: {processing_scale:g}')
-
-    for path in paths:
-        image = cv2.imread(str(path))
-        if image is None:
-            print(f'SKIP unreadable: {path.name}')
-            continue
-
-        started = time.perf_counter()
-        strong_candidates = detect_single_segments(
-            image, classifier, config, processing_scale)
-        weak_candidates = []
-        single_candidates = list(strong_candidates)
-        three_candidates = detect_three_segments(single_candidates, args)
-        if not three_candidates:
-            strong_colors = {item.color for item in strong_candidates}
-            allowed_colors = {
-                item.name for item in config.colors
-                if item.name not in strong_colors
-            }
-            weak_candidates = weak_segments_from_masks(
-                image, classifier, config, processing_scale, allowed_colors)
-            single_candidates = merge_strong_and_weak_segments(
-                strong_candidates, weak_candidates)
-            three_candidates = detect_three_segments(single_candidates, args)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        timings.append(elapsed_ms)
-
-        winner = three_candidates[0] if three_candidates else None
-        if winner is not None:
-            detected += 1
-            ambiguous += int(winner.ambiguous)
-            label = '-'.join(winner.symbols)
-            status = 'AMBIG' if winner.ambiguous else 'OK'
-            score = winner.score
-        else:
-            label = 'NONE'
-            status = 'NONE'
-            score = 0.0
-
-        output = annotate_three_segments(image, single_candidates, three_candidates)
-        out_path = output_dir / path.name
-        ok = cv2.imwrite(
-            str(out_path), output,
-            [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
-        if not ok:
-            raise RuntimeError(f'保存失败：{out_path}')
-
-        rows.append(
-            f'{path.name},{status},{label},{score:.6f},'
-            f'{len(single_candidates)},{len(three_candidates)},{elapsed_ms:.3f}')
-        print(
-            f'{path.name}: {status} {label} score={score:.3f} '
-            f'singles={len(single_candidates)} '
-            f'(strong={len(strong_candidates)} weak={len(weak_candidates)}) '
-            f'triples={len(three_candidates)} '
-            f'time={elapsed_ms:.1f}ms')
-
-    summary_path = output_dir / 'summary.csv'
-    summary_path.write_text(
-        'file,status,symbols,score,single_candidates,three_candidates,time_ms\n'
-        + '\n'.join(rows) + '\n',
-        encoding='utf-8')
-
-    if timings:
-        values = np.array(timings, dtype=np.float32)
-        p95 = float(np.percentile(values, 95))
-        print(
-            f'summary: images={len(timings)} detected={detected} '
-            f'ambiguous={ambiguous} mean={float(np.mean(values)):.1f}ms '
-            f'p95={p95:.1f}ms')
-        print(f'summary_csv: {summary_path}')
-
-
-if __name__ == '__main__':
-    main()

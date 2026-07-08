@@ -130,6 +130,9 @@ protocol_geometry:
   max_length_ratio: 3.0
   max_gap_ratio: 5.0
   max_candidates: 8
+  # 三段协议快筛：少于 3 种协议颜色时不跑精检测；大色块通常是背景反光。
+  min_coarse_colors: 3
+  max_candidate_crop_area_pixels: 45000
 
 three_segment:
   # usb_rgb_1 三段灯带专用快速检测参数。

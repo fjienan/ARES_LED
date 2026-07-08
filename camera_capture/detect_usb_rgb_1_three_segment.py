@@ -3,12 +3,10 @@
 
 import argparse
 from dataclasses import replace
-from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 import time
-from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -17,16 +15,24 @@ import yaml
 from detect_usb_rgb_2_three_segment import (
     REPO_ROOT,
     R2_PACKAGE,
-    WeakStripDetection,
-    annotate_three_segments,
-    build_three_segment_candidate,
-    deduplicate_three_segment_candidates,
     image_paths,
 )
 
+SHARED_PACKAGE = REPO_ROOT / 'shared' / 'src' / 'rgb_comm_protocol'
+sys.path.insert(0, str(SHARED_PACKAGE))
 sys.path.insert(0, str(R2_PACKAGE))
 
+from rgb_comm_protocol import FixedColorProtocol  # noqa: E402
 from rgb_camera_receiver.classifier import classifier_for_profile  # noqa: E402
+from rgb_camera_receiver.protocol_decoder import (  # noqa: E402
+    annotate_protocol,
+    decode_protocol_candidates,
+    load_pairing_config,
+    protocol_color_symbols,
+    scaled_candidate_crop_area,
+    select_protocol_winner,
+)
+from rgb_camera_receiver.three_segment import annotate_three_segments  # noqa: E402
 
 
 def parse_args():
@@ -94,230 +100,53 @@ def config_value(args, config_rows, name: str, default):
     return config_rows.get(name, default)
 
 
-def line_segment_from_color_pixels(
-        color: str,
-        mask: np.ndarray,
-        component_mask: np.ndarray,
-        scale: float,
-        args) -> Optional[WeakStripDetection]:
-    selected = cv2.bitwise_and(mask.astype(np.uint8), component_mask)
-    count, labels, stats, centers = cv2.connectedComponentsWithStats(selected, 8)
-    if count <= 1:
-        return None
-
-    components = []
-    for index in range(1, count):
-        area = int(stats[index, cv2.CC_STAT_AREA])
-        if area < 1:
-            continue
-        components.append((area, index))
-    if not components:
-        return None
-    pixel_count = sum(area for area, _ in components)
-    if pixel_count < args.fast_min_color_pixels:
-        return None
-
-    points = []
-    component_centers = []
-    for area, index in components:
-        ys, xs = np.nonzero(labels == index)
-        if len(xs) == 0:
-            continue
-        points.append(np.column_stack([xs, ys]).astype(np.float32))
-        if area >= 2:
-            component_centers.append(centers[index].astype(np.float32))
-    if not points:
-        return None
-    points = np.concatenate(points, axis=0)
-    if len(points) < args.fast_min_color_pixels:
-        return None
-
-    center = points.mean(axis=0)
-    centered = points - center
-    if len(points) >= 2:
-        _, _, vt = np.linalg.svd(centered, full_matrices=False)
-        axis = vt[0].astype(np.float32)
-        axis /= max(float(np.linalg.norm(axis)), 1e-6)
-        normal = np.array((-axis[1], axis[0]), dtype=np.float32)
-        projection = centered @ axis
-        cross = centered @ normal
-        residual = float(np.sqrt(np.mean(np.square(cross))))
-    else:
-        axis = np.array((1.0, 0.0), dtype=np.float32)
-        normal = np.array((0.0, 1.0), dtype=np.float32)
-        projection = np.zeros((len(points),), dtype=np.float32)
-        cross = np.zeros((len(points),), dtype=np.float32)
-        residual = 0.0
-    length = float(np.max(projection) - np.min(projection))
-    if length < args.fast_min_segment_length:
-        return None
-    cross_width = float(np.percentile(np.abs(cross), 90) * 2.0 + 3.0)
-    thickness = max(cross_width, 3.0)
-    start = center + axis * float(np.min(projection))
-    end = center + axis * float(np.max(projection))
-    half_width = normal * (thickness * 0.5)
-    corners = np.stack([
-        start - half_width,
-        end - half_width,
-        end + half_width,
-        start + half_width,
-    ], axis=0).astype(np.float32)
-    aspect = length / thickness
-    aspect_quality = float(np.clip((aspect - 1.2) / 5.0, 0.0, 1.0))
-    pixel_quality = float(np.clip(pixel_count / 120.0, 0.0, 1.0))
-    length_quality = float(np.clip(length / 70.0, 0.0, 1.0))
-    score = float(np.clip(
-        0.28 + 0.72 *
-        (0.35 + 0.65 * aspect_quality) *
-        (0.35 + 0.65 * pixel_quality) *
-        (0.35 + 0.65 * length_quality),
-        0.0, 1.0))
-
-    inverse = 1.0 / scale
-    peaks = None
-    if component_centers:
-        peaks = np.stack(component_centers, axis=0) * inverse
-    return WeakStripDetection(
-        color=color,
-        confidence=float(np.sqrt(score)),
-        score=score,
-        corners=corners * inverse,
-        dot_count=len(component_centers),
-        length=length * inverse,
-        residual=residual * inverse,
-        spacing_cv=0.0,
-        line_quality=aspect_quality,
-        dot_quality=float(np.clip(len(component_centers) / 6.0, 0.0, 1.0)),
-        periodic_quality=length_quality,
-        color_quality=pixel_quality,
-        valley_quality=0.0,
-        peak_centers=peaks,
-        mode='three_fast',
-    )
-
-
-def segments_from_color_components(
-        masks,
-        processing_scale: float,
-        args) -> List[WeakStripDetection]:
-    """分别从每种颜色的连通区域生成单段候选，不要求三段彼此贴近。"""
-    kernel_size = max(1, int(args.fast_dilate_pixels))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    candidates: List[WeakStripDetection] = []
-
-    for color, mask in masks.items():
-        if int(mask.sum()) < args.fast_min_color_pixels:
-            continue
-        grouped = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(grouped, 8)
-        color_candidates: List[WeakStripDetection] = []
-        for index in range(1, count):
-            area = int(stats[index, cv2.CC_STAT_AREA])
-            if area < args.fast_min_component_area:
-                continue
-            if (
-                    args.fast_max_component_area > 0 and
-                    area > args.fast_max_component_area):
-                continue
-            x, y, width, height = stats[index, :4]
-            aspect = max(width, height) / max(float(min(width, height)), 1.0)
-            if aspect < args.fast_min_union_aspect:
-                continue
-            component_mask = (labels == index).astype(np.uint8)
-            segment = line_segment_from_color_pixels(
-                color, mask, component_mask, processing_scale, args)
-            if segment is not None:
-                color_candidates.append(segment)
-        color_candidates.sort(key=lambda item: item.score, reverse=True)
-        limit = max(1, int(args.fast_max_segments_per_color))
-        candidates.extend(color_candidates[:limit])
-    candidates.sort(key=lambda item: item.score, reverse=True)
-    return candidates
-
-
-def fast_single_segments(image, classifier, config, processing_scale: float, args):
-    work = scaled_frame(image, processing_scale)
-    hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
-    masks = {
-        color: mask.astype(np.uint8)
-        for color, mask in classifier.color_masks(hsv, work, config).items()
-    }
-    active_colors = [
-        color for color, mask in masks.items()
-        if int(mask.sum()) >= args.fast_min_color_pixels
-    ]
-    if len(active_colors) < 3:
-        return []
-    if sum(int(mask.sum()) for mask in masks.values()) < args.fast_min_color_pixels * 3:
-        return []
-    candidates = segments_from_color_components(
-        masks, processing_scale, args)
-    candidates.sort(key=lambda item: item.score, reverse=True)
-    return candidates[:max(args.max_single_candidates, 3)]
-
-
 def detect_frame(image, classifier, config, processing_scale: float, args):
-    single_candidates = fast_single_segments(
-        image, classifier, config, processing_scale, args)
-    three_candidates = detect_three_segments(single_candidates, args)
-    return single_candidates, [], single_candidates, three_candidates
-
-
-def detect_three_segments(single_candidates, args):
-    """组合三段候选；usb_rgb_1 当前协议要求三段颜色全不同，排除 ABA。"""
-    limited = list(single_candidates[:max(args.max_single_candidates, 3)])
-    raw = []
-    for triple in combinations(limited, 3):
-        if len({item.color for item in triple}) != 3:
-            continue
-        candidate = build_three_segment_candidate(triple, args)
-        if candidate is not None:
-            raw.append(candidate)
-
-    candidates = deduplicate_three_segment_candidates(raw)
-    candidates = candidates[:max(args.max_results, 1)]
-    if len(candidates) >= 2:
-        margin = candidates[0].score / max(candidates[1].score, 1e-9)
-        if margin < args.winner_margin:
-            candidates[0] = replace(candidates[0], ambiguous=True)
-    return candidates
+    work = scaled_frame(image, processing_scale)
+    candidates = classifier.detect_protocol_candidates(
+        work,
+        config,
+        protocol_color_symbols(args.protocol),
+        args.pairing_config.min_coarse_colors,
+        scaled_candidate_crop_area(args.pairing_config, processing_scale))
+    if processing_scale < 0.999:
+        inverse = 1.0 / processing_scale
+        candidates = [item.scaled(inverse) for item in candidates]
+    protocol_candidates = decode_protocol_candidates(
+        candidates, args.protocol, args.pairing_config)
+    protocol_winner = select_protocol_winner(
+        protocol_candidates, args.winner_margin)
+    return candidates, protocol_candidates, protocol_winner
 
 
 def three_segment_args(args, config_path: Path):
-    rows = read_three_segment_config(config_path)
+    pairing_config = load_pairing_config(str(config_path))
+    overrides = {}
+    if args.min_three_score is not None:
+        overrides['min_command_score'] = float(args.min_three_score)
+    if args.max_angle_degrees is not None:
+        overrides['max_angle_degrees'] = float(args.max_angle_degrees)
+    if args.max_cross_distance is not None:
+        overrides['max_cross_distance_pixels'] = float(args.max_cross_distance)
+    if args.min_center_distance_ratio is not None:
+        overrides['min_center_distance_ratio'] = float(
+            args.min_center_distance_ratio)
+    if args.max_center_distance_ratio is not None:
+        overrides['max_center_distance_ratio'] = float(
+            args.max_center_distance_ratio)
+    if args.max_gap_ratio is not None:
+        overrides['max_gap_ratio'] = float(args.max_gap_ratio)
+    if args.max_results is not None:
+        overrides['max_candidates'] = int(args.max_results)
+    if overrides:
+        pairing_config = replace(pairing_config, **overrides)
     return SimpleNamespace(
-        max_single_candidates=int(config_value(
-            args, rows, 'max_single_candidates', 30)),
-        max_results=int(config_value(args, rows, 'max_results', 8)),
-        min_three_score=float(config_value(
-            args, rows, 'min_three_score', 0.08)),
-        winner_margin=float(config_value(args, rows, 'winner_margin', 1.2)),
-        max_angle_degrees=float(config_value(
-            args, rows, 'max_angle_degrees', 18.0)),
-        max_cross_distance=float(config_value(
-            args, rows, 'max_cross_distance', 45.0)),
-        min_center_distance_ratio=float(config_value(
-            args, rows, 'min_center_distance_ratio', 0.25)),
-        max_center_distance_ratio=float(config_value(
-            args, rows, 'max_center_distance_ratio', 4.5)),
-        max_gap_ratio=float(config_value(args, rows, 'max_gap_ratio', 3.4)),
-        fast_dilate_pixels=int(config_value(
-            args, rows, 'fast_dilate_pixels', 5)),
-        fast_min_component_area=int(config_value(
-            args, rows, 'fast_min_component_area', 70)),
-        fast_max_component_area=int(config_value(
-            args, rows, 'fast_max_component_area', 8000)),
-        fast_min_color_pixels=int(config_value(
-            args, rows, 'fast_min_color_pixels', 20)),
-        fast_min_segment_length=float(config_value(
-            args, rows, 'fast_min_segment_length', 14.0)),
-        fast_min_union_aspect=float(config_value(
-            args, rows, 'fast_min_union_aspect', 1.35)),
-        fast_max_segments_per_color=int(config_value(
-            args, rows, 'fast_max_segments_per_color', 2)),
+        protocol=FixedColorProtocol(),
+        pairing_config=pairing_config,
+        winner_margin=float(
+            args.winner_margin
+            if args.winner_margin is not None
+            else 1.2),
+        min_three_score=pairing_config.min_command_score,
     )
 
 
@@ -325,10 +154,7 @@ def resolve_processing_scale(args, config, config_path: Path) -> float:
     if args.processing_scale is not None:
         value = float(args.processing_scale)
     else:
-        rows = read_three_segment_config(config_path)
-        value = float(rows.get(
-            'processing_scale',
-            getattr(config, 'processing_scale', 1.0)))
+        value = float(getattr(config, 'processing_scale', 1.0))
     return min(1.0, max(value, 0.1))
 
 
@@ -356,7 +182,6 @@ def main():
     combo_args = three_segment_args(args, config_path)
     timings = []
     detected = 0
-    ambiguous = 0
     rows = []
 
     print(f'profile: usb_rgb_1')
@@ -372,24 +197,31 @@ def main():
             continue
 
         started = time.perf_counter()
-        strong, weak, singles, triples = detect_frame(
+        candidates, protocol_candidates, protocol_winner = detect_frame(
             image, classifier, config, processing_scale, combo_args)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         timings.append(elapsed_ms)
 
-        winner = triples[0] if triples else None
-        if winner is not None:
+        if protocol_winner is not None:
             detected += 1
-            ambiguous += int(winner.ambiguous)
-            label = '-'.join(winner.symbols)
-            status = 'AMBIG' if winner.ambiguous else 'OK'
-            score = winner.score
+            label = '-'.join(protocol_winner.symbols)
+            status = f'OK:{protocol_winner.command_id}'
+            score = protocol_winner.score
         else:
             label = 'NONE'
             status = 'NONE'
             score = 0.0
 
-        output = annotate_three_segments(image, singles, triples)
+        single_winner = classifier.select_winner(candidates, config)
+        output = classifier.annotate(image, candidates, single_winner)
+        output = annotate_protocol(
+            output,
+            protocol_candidates,
+            protocol_winner,
+            'OFFLINE',
+            1 if protocol_winner is not None else 0,
+            1,
+        )
         out_path = output_dir / path.name
         ok = cv2.imwrite(
             str(out_path), output,
@@ -399,17 +231,16 @@ def main():
 
         rows.append(
             f'{path.name},{status},{label},{score:.6f},'
-            f'{len(singles)},{len(triples)},{elapsed_ms:.3f}')
+            f'{len(candidates)},{len(protocol_candidates)},{elapsed_ms:.3f}')
         print(
             f'{path.name}: {status} {label} score={score:.3f} '
-            f'singles={len(singles)} '
-            f'(strong={len(strong)} weak={len(weak)}) '
-            f'triples={len(triples)} '
+            f'strip_candidates={len(candidates)} '
+            f'protocol_candidates={len(protocol_candidates)} '
             f'time={elapsed_ms:.1f}ms')
 
     summary_path = output_dir / 'summary.csv'
     summary_path.write_text(
-        'file,status,symbols,score,single_candidates,three_candidates,time_ms\n'
+        'file,status,symbols,score,strip_candidates,protocol_candidates,time_ms\n'
         + '\n'.join(rows) + '\n',
         encoding='utf-8')
 
@@ -417,7 +248,7 @@ def main():
         values = np.array(timings, dtype=np.float32)
         print(
             f'summary: images={len(timings)} detected={detected} '
-            f'ambiguous={ambiguous} mean={float(np.mean(values)):.1f}ms '
+            f'mean={float(np.mean(values)):.1f}ms '
             f'p95={float(np.percentile(values, 95)):.1f}ms')
         print(f'summary_csv: {summary_path}')
 

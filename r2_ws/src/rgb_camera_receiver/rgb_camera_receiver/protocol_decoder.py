@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from functools import cmp_to_key
 from itertools import combinations
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -13,6 +14,9 @@ from rgb_comm_protocol import FixedColorProtocol
 from .classifier import StripDetection
 
 
+IMAGE_ORDER_X_TOLERANCE = 12.0
+
+
 @dataclass(frozen=True)
 class ProtocolGeometryConfig:
     min_command_score: float = 0.04
@@ -24,6 +28,8 @@ class ProtocolGeometryConfig:
     max_length_ratio: float = 2.8
     max_gap_ratio: float = 4.0
     max_candidates: int = 20
+    min_coarse_colors: int = 3
+    max_candidate_crop_area_pixels: float = 45000.0
 
 
 # 保留旧名称，兼容已有测试和外部导入。
@@ -71,6 +77,9 @@ def load_pairing_config(path: str) -> ProtocolGeometryConfig:
                     'max_center_distance_ratio', 3.0),
                 'max_gap_ratio': three.get('max_gap_ratio', 4.0),
                 'max_candidates': three.get('max_results', 20),
+                'min_coarse_colors': three.get('min_coarse_colors', 3),
+                'max_candidate_crop_area_pixels': three.get(
+                    'max_candidate_crop_area_pixels', 45000.0),
             }
         else:
             pairing = raw.get('pairing', {})
@@ -87,6 +96,9 @@ def load_pairing_config(path: str) -> ProtocolGeometryConfig:
                 'min_length_ratio': pairing.get('min_length_ratio', 0.35),
                 'max_length_ratio': pairing.get('max_length_ratio', 2.8),
                 'max_candidates': pairing.get('max_pairs', 20),
+                'min_coarse_colors': pairing.get('min_coarse_colors', 3),
+                'max_candidate_crop_area_pixels': pairing.get(
+                    'max_candidate_crop_area_pixels', 45000.0),
             }
 
     return ProtocolGeometryConfig(
@@ -102,7 +114,29 @@ def load_pairing_config(path: str) -> ProtocolGeometryConfig:
         max_length_ratio=float(row.get('max_length_ratio', 2.8)),
         max_gap_ratio=float(row.get('max_gap_ratio', 4.0)),
         max_candidates=int(row.get('max_candidates', 20)),
+        min_coarse_colors=int(row.get('min_coarse_colors', 3)),
+        max_candidate_crop_area_pixels=float(
+            row.get('max_candidate_crop_area_pixels', 45000.0)),
     )
+
+
+def protocol_color_symbols(protocol: FixedColorProtocol) -> Tuple[str, ...]:
+    symbols = {
+        symbol
+        for code in protocol.commands.values()
+        for symbol in code
+    }
+    return tuple(sorted(symbols))
+
+
+def scaled_candidate_crop_area(
+        config: ProtocolGeometryConfig,
+        processing_scale: float) -> float:
+    max_area = float(config.max_candidate_crop_area_pixels)
+    if max_area <= 0.0:
+        return max_area
+    scale = min(1.0, max(float(processing_scale), 0.1))
+    return max_area * scale * scale
 
 
 def _axis(candidate: StripDetection) -> Tuple[np.ndarray, np.ndarray]:
@@ -140,6 +174,29 @@ def _angle_spread_degrees(axes: Sequence[np.ndarray]) -> float:
     return max_angle
 
 
+def _image_order_indices(
+        centers: np.ndarray,
+        x_tolerance: float = IMAGE_ORDER_X_TOLERANCE):
+    def compare(left_index: int, right_index: int) -> int:
+        left = centers[left_index]
+        right = centers[right_index]
+        if abs(float(left[0] - right[0])) <= x_tolerance:
+            if float(left[1]) < float(right[1]):
+                return -1
+            if float(left[1]) > float(right[1]):
+                return 1
+        else:
+            if float(left[0]) < float(right[0]):
+                return -1
+            if float(left[0]) > float(right[0]):
+                return 1
+        return int(left_index) - int(right_index)
+
+    return np.array(
+        sorted(range(len(centers)), key=cmp_to_key(compare)),
+        dtype=np.int64)
+
+
 def _sequence_geometry(
         raw_segments: Sequence[StripDetection],
         config: ProtocolGeometryConfig
@@ -154,7 +211,7 @@ def _sequence_geometry(
     common_axis = _aligned_average_axis(axes)
     origin = np.mean(centers, axis=0)
     projections = (centers - origin) @ common_axis
-    order = np.argsort(projections)
+    order = _image_order_indices(centers)
     ordered = tuple(raw_segments[index] for index in order)
     ordered_centers = centers[order]
     ordered_proj = projections[order]
@@ -165,7 +222,7 @@ def _sequence_geometry(
     if cross_distance > config.max_cross_distance_pixels:
         return None
 
-    gaps = np.diff(ordered_proj)
+    gaps = np.abs(np.diff(ordered_proj))
     if len(gaps) == 0 or np.any(gaps <= 1e-6):
         return None
 

@@ -3,6 +3,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import rgb_camera_receiver.classifier_usb_rgb_1 as classifier_usb_rgb_1
 from rgb_camera_receiver.classifier import (
     StripDetection,
     _deduplicate_candidates,
@@ -63,6 +64,59 @@ def test_rejects_short_colored_bar():
     image = np.zeros((240, 360, 3), dtype=np.uint8)
     cv2.rectangle(image, (35, 100), (95, 108), color_bgr('GREEN'), -1)
     assert detect_candidates(image, CONFIG) == []
+
+
+def test_protocol_fast_path_skips_when_not_enough_colors(monkeypatch):
+    image = np.zeros((240, 360, 3), dtype=np.uint8)
+    cv2.rectangle(image, (40, 80), (58, 98), color_bgr('BLUE'), -1)
+
+    def fail_refine(*_args, **_kwargs):
+        raise AssertionError('protocol fast path should not refine this frame')
+
+    monkeypatch.setattr(
+        classifier_usb_rgb_1, '_detect_color_proposals_full', fail_refine)
+
+    candidates = classifier_usb_rgb_1.detect_protocol_candidates(
+        image, CONFIG, ('BLUE', 'RED', 'GREEN'), 3, 45000.0)
+
+    assert candidates == []
+
+
+def test_protocol_fast_path_skips_large_crops(monkeypatch):
+    image = np.zeros((240, 360, 3), dtype=np.uint8)
+    cv2.rectangle(image, (40, 80), (60, 100), color_bgr('BLUE'), -1)
+
+    def fail_refine(*_args, **_kwargs):
+        raise AssertionError('large protocol crop should not be refined')
+
+    monkeypatch.setattr(
+        classifier_usb_rgb_1, '_detect_color_proposals_full', fail_refine)
+
+    candidates = classifier_usb_rgb_1.detect_protocol_candidates(
+        image, CONFIG, ('BLUE', 'RED', 'GREEN'), 1, 100.0)
+
+    assert candidates == []
+
+
+def test_protocol_fast_path_refines_small_three_color_regions(monkeypatch):
+    image = np.zeros((240, 360, 3), dtype=np.uint8)
+    for x, color in ((40, 'BLUE'), (140, 'RED'), (240, 'GREEN')):
+        cv2.rectangle(image, (x, 80), (x + 12, 92), color_bgr(color), -1)
+
+    calls = []
+
+    def fake_refine(_crop, _config, model):
+        calls.append(model.name)
+        return [detection(model.name, 2.0, 28.0)]
+
+    monkeypatch.setattr(
+        classifier_usb_rgb_1, '_detect_color_proposals_full', fake_refine)
+
+    candidates = classifier_usb_rgb_1.detect_protocol_candidates(
+        image, CONFIG, ('BLUE', 'RED', 'GREEN'), 3, 45000.0)
+
+    assert {'BLUE', 'RED', 'GREEN'} <= set(calls)
+    assert {'BLUE', 'RED', 'GREEN'} <= {item.color for item in candidates}
 
 
 def test_accepts_long_merged_led_strip():

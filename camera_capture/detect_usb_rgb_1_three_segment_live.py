@@ -97,6 +97,24 @@ def save_positive_frame(
     return now
 
 
+def save_slow_frame(
+        output_dir: Path,
+        frame,
+        elapsed_ms: float,
+        symbols: str,
+        jpeg_quality: int):
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+    filename = (
+        f'slow_{symbols.lower()}_{timestamp}_time{elapsed_ms:.1f}ms.jpg')
+    path = output_dir / filename
+    ok = cv2.imwrite(
+        str(path), frame,
+        [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+    if not ok:
+        raise RuntimeError(f'保存失败：{path}')
+    print(f'saved slow frame: {path}')
+
+
 def main():
     args = parse_args()
     if not 1 <= args.jpeg_quality <= 100:
@@ -124,12 +142,13 @@ def main():
     print(f'detector: {config_path}')
     print(f'device: {selected_device} ({camera_name(selected_device)})')
     print(f'processing_scale: {processing_scale:g}')
-    print(f'min_three_score: {args.min_three_score:g}')
+    print(f'min_command_score: {combo_args.min_three_score:g}')
     if args.no_save:
         print('positive saving: disabled')
     else:
         print(f'positive output: {output_dir}')
         print(f'positive interval: {args.interval:g}s')
+        print('slow frame output: enabled when detection time > 100ms')
     print('press q/Esc/Ctrl+C to stop')
 
     if not args.no_preview:
@@ -147,24 +166,27 @@ def main():
                 continue
 
             started = time.perf_counter()
-            strong, weak, singles, triples = detect_frame(
+            candidates, protocol_candidates, protocol_winner = detect_frame(
                 frame, classifier, config, processing_scale, combo_args)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
-            winner = triples[0] if triples else None
             now = time.monotonic()
+            slow_symbols = 'none'
 
-            if winner is None:
+            if protocol_winner is None:
                 positive_active = False
                 label = (
-                    f'NONE singles={len(singles)} '
-                    f'(strong={len(strong)} weak={len(weak)}) '
+                    f'NONE strip_candidates={len(candidates)} '
+                    f'protocol_candidates={len(protocol_candidates)} '
                     f'time={elapsed_ms:.1f}ms')
             else:
-                symbols = ''.join(symbol[0] for symbol in winner.symbols)
+                symbols = ''.join(symbol[0] for symbol in protocol_winner.symbols)
+                slow_symbols = symbols
                 label = (
-                    f'{symbols} score={winner.score:.3f} '
-                    f'conf={winner.confidence:.2f} '
-                    f'triples={len(triples)} time={elapsed_ms:.1f}ms')
+                    f'id={protocol_winner.command_id} {symbols} '
+                    f'score={protocol_winner.score:.3f} '
+                    f'conf={protocol_winner.confidence:.2f} '
+                    f'protocol_candidates={len(protocol_candidates)} '
+                    f'time={elapsed_ms:.1f}ms')
                 if not args.no_save:
                     should_save = (
                         (not positive_active)
@@ -175,17 +197,22 @@ def main():
                     positive_active = True
                     if should_save:
                         last_save_time = save_positive_frame(
-                            output_dir, frame, symbols, winner.score, now,
-                            args.jpeg_quality)
+                            output_dir, frame, symbols,
+                            protocol_winner.score, now, args.jpeg_quality)
                 else:
                     positive_active = True
+
+            if not args.no_save and elapsed_ms > 100.0:
+                save_slow_frame(
+                    output_dir, frame, elapsed_ms, slow_symbols,
+                    args.jpeg_quality)
 
             if label != last_label:
                 print(label)
                 last_label = label
 
             if not args.no_preview:
-                rendered = annotate_three_segments(frame, singles, triples)
+                rendered = annotate_three_segments(frame, [], protocol_candidates)
                 if args.preview_scale != 1.0:
                     rendered = cv2.resize(
                         rendered, None,

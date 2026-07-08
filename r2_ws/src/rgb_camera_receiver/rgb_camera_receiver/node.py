@@ -16,9 +16,10 @@ from rgb_comm_protocol import FixedColorProtocol
 
 from .classifier import classifier_for_profile
 from .protocol_decoder import (
-    annotate_protocol,
     decode_protocol_candidates,
     load_pairing_config,
+    protocol_color_symbols,
+    scaled_candidate_crop_area,
     select_protocol_winner,
 )
 from .profiles import (
@@ -26,6 +27,16 @@ from .profiles import (
     detector_config_path,
     require_calibrated_detector,
     validate_camera_profile,
+)
+from .three_segment import (
+    annotate_three_segments,
+    detect_three_segment_frame,
+    load_three_segment_config,
+)
+from .three_segment_protocol import (
+    protocol_candidates_from_triples,
+    protocol_detection_from_three_segment,
+    protocol_winner_from_triples,
 )
 
 
@@ -42,6 +53,19 @@ def _read_camera_frame(capture):
         os.close(saved_stderr_fd)
 
 
+def _preview_window_title(node_name: str, namespace: str, output_topic: str,
+                          profile: str) -> str:
+    for item in (node_name, namespace, output_topic):
+        for part in reversed(item.strip('/').split('/')):
+            if part.startswith('rgb_camera_receiver_'):
+                suffix = part.removeprefix('rgb_camera_receiver_')
+                if suffix:
+                    return f'R2 LED strip detector - {suffix} ({profile})'
+            if part.startswith('camera_'):
+                return f'R2 LED strip detector - {part} ({profile})'
+    return f'R2 LED strip detector - {profile}'
+
+
 class LedStripReceiver(Node):
     """与协议无关的灯带检测器实时摄像头前端。"""
 
@@ -49,6 +73,7 @@ class LedStripReceiver(Node):
         super().__init__('rgb_camera_receiver')
         profile = validate_camera_profile(str(self.declare_parameter(
             'camera_profile', DEFAULT_CAMERA_PROFILE).value))
+        self.profile = profile
         self.classifier = classifier_for_profile(profile)
         self.requested_device = str(self.declare_parameter('camera_device', 'auto').value)
         self.frame_width = int(self.declare_parameter('frame_width', 1280).value)
@@ -101,10 +126,17 @@ class LedStripReceiver(Node):
         self.protocol = FixedColorProtocol(
             config_path=protocol_config if protocol_config else None)
         self.pairing_config = load_pairing_config(config_path)
+        self.three_segment_config = (
+            load_three_segment_config(config_path)
+            if self.profile == 'usb_rgb_2'
+            else None
+        )
         self.protocol_margin = max(float(self.declare_parameter(
             'protocol_winner_margin', 1.2).value), 1.0)
         output_topic = str(self.declare_parameter(
             'output_topic', '/aruco_comm/rx_id').value)
+        self.preview_window_title = _preview_window_title(
+            self.get_name(), self.get_namespace(), output_topic, self.profile)
         self.publisher = self.create_publisher(Int32, output_topic, 10)
         self.reset_command_id = int(self.declare_parameter(
             'reset_command_id', 0).value)
@@ -145,18 +177,42 @@ class LedStripReceiver(Node):
             self.capture = None
             self.device = ''
             return
-        work = frame
-        scale = self.processing_scale
-        if scale < 1.0:
-            work = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        candidates = self.classifier.detect_candidates(work, self.config)
-        if scale < 1.0:
-            inverse = 1.0 / scale
-            candidates = [item.scaled(inverse) for item in candidates]
-        protocol_candidates = decode_protocol_candidates(
-            candidates, self.protocol, self.pairing_config)
-        protocol_winner = select_protocol_winner(
-            protocol_candidates, self.protocol_margin)
+        triples = []
+        if self.profile == 'usb_rgb_2':
+            assert self.three_segment_config is not None
+            strong, weak, candidates, triples = detect_three_segment_frame(
+                frame,
+                self.classifier,
+                self.config,
+                self.processing_scale,
+                self.three_segment_config)
+            protocol_candidates = self._protocol_candidates_from_triples(triples)
+            protocol_winner = self._protocol_winner_from_triples(triples)
+            candidate_count_label = (
+                f'strip_candidates={len(candidates)} '
+                f'three_candidates={len(triples)} '
+                f'strong={len(strong)} weak={len(weak)}')
+        else:
+            work = frame
+            scale = self.processing_scale
+            if scale < 1.0:
+                work = cv2.resize(
+                    frame, None, fx=scale, fy=scale,
+                    interpolation=cv2.INTER_AREA)
+            candidates = self.classifier.detect_protocol_candidates(
+                work,
+                self.config,
+                protocol_color_symbols(self.protocol),
+                self.pairing_config.min_coarse_colors,
+                scaled_candidate_crop_area(self.pairing_config, scale))
+            if scale < 1.0:
+                inverse = 1.0 / scale
+                candidates = [item.scaled(inverse) for item in candidates]
+            protocol_candidates = decode_protocol_candidates(
+                candidates, self.protocol, self.pairing_config)
+            protocol_winner = select_protocol_winner(
+                protocol_candidates, self.protocol_margin)
+            candidate_count_label = f'strip_candidates={len(candidates)}'
         confirmed_count = self._update_protocol_state(protocol_winner)
         self._save_positive_frame(frame, protocol_winner)
         if protocol_winner is None:
@@ -166,7 +222,7 @@ class LedStripReceiver(Node):
         if label != self.last_label:
             if protocol_winner is None:
                 self.get_logger().info(
-                    f'command=NONE strip_candidates={len(candidates)} '
+                    f'command=NONE {candidate_count_label} '
                     f'protocol_candidates={len(protocol_candidates)} '
                     f'state=WAIT')
             else:
@@ -187,22 +243,25 @@ class LedStripReceiver(Node):
                     f'state=WAIT')
             self.last_label = label
         if self.preview:
-            single_winner = self.classifier.select_winner(candidates, self.config)
-            rendered = self.classifier.annotate(frame, candidates, single_winner)
-            rendered = annotate_protocol(
-                rendered,
-                protocol_candidates,
-                protocol_winner,
-                'WAIT',
-                confirmed_count,
-                self.confirmation_required,
-            )
+            if self.profile == 'usb_rgb_2':
+                rendered = annotate_three_segments(frame, candidates, triples)
+            else:
+                rendered = annotate_three_segments(frame, [], protocol_candidates)
             if self.preview_scale != 1.0:
                 rendered = cv2.resize(
                     rendered, None, fx=self.preview_scale, fy=self.preview_scale,
                     interpolation=cv2.INTER_AREA)
-            cv2.imshow('R2 LED strip detector', rendered)
+            cv2.imshow(self.preview_window_title, rendered)
             cv2.waitKey(1)
+
+    def _protocol_detection_from_three_segment(self, item):
+        return protocol_detection_from_three_segment(self.protocol, item)
+
+    def _protocol_candidates_from_triples(self, triples):
+        return protocol_candidates_from_triples(self.protocol, triples)
+
+    def _protocol_winner_from_triples(self, triples):
+        return protocol_winner_from_triples(self.protocol, triples)
 
     def _update_protocol_state(self, winner) -> int:
         now = time.monotonic()

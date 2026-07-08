@@ -1612,6 +1612,84 @@ def detect_proposals(
     return _deduplicate_candidates(raw)
 
 
+def detect_protocol_candidates(
+        bgr: np.ndarray,
+        config: DetectorConfig,
+        required_colors: Sequence[str],
+        min_required_colors: int,
+        max_crop_area_pixels: float) -> List[StripDetection]:
+    """三段协议专用候选生成，避免 NONE 场景的大色块进入精检测。"""
+    if bgr is None or bgr.size == 0:
+        return []
+    valid_colors = {
+        str(color).upper()
+        for color in required_colors
+    }
+    if not valid_colors:
+        return detect_candidates(bgr, config)
+    if not config.coarse_regions:
+        return [
+            item for item in detect_candidates(bgr, config)
+            if item.color in valid_colors
+        ]
+
+    coarse_bgr = bgr
+    coarse_scale = config.coarse_processing_scale
+    if coarse_scale < 1.0:
+        coarse_bgr = cv2.resize(
+            bgr, None, fx=coarse_scale, fy=coarse_scale,
+            interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(coarse_bgr, cv2.COLOR_BGR2HSV)
+    if config.coarse_include_generic_color:
+        value = hsv[:, :, 2].astype(np.float32)
+        smooth = cv2.GaussianBlur(
+            value, (0, 0), config.dog_sigma_small)
+        broad = cv2.GaussianBlur(
+            value, (0, 0), config.dog_sigma_large)
+        dog = smooth - broad
+    else:
+        dog = np.zeros(hsv.shape[:2], dtype=np.float32)
+
+    rectangles = [
+        (color, rect)
+        for color, rect in _coarse_region_rectangles_by_color(
+            hsv, coarse_bgr, dog, config)
+        if color in valid_colors
+    ]
+    if len({color for color, _ in rectangles}) < max(1, int(min_required_colors)):
+        return []
+
+    models = {model.name: model for model in config.colors}
+    height, width = bgr.shape[:2]
+    max_crop_area = float(max_crop_area_pixels)
+    raw: List[StripDetection] = []
+    for color, (x0, y0, x1, y1) in rectangles:
+        if coarse_scale < 1.0:
+            inverse = 1.0 / coarse_scale
+            x0 = int(np.floor(x0 * inverse))
+            y0 = int(np.floor(y0 * inverse))
+            x1 = int(np.ceil(x1 * inverse))
+            y1 = int(np.ceil(y1 * inverse))
+        x0 = int(np.clip(x0, 0, width))
+        x1 = int(np.clip(x1, 0, width))
+        y0 = int(np.clip(y0, 0, height))
+        y1 = int(np.clip(y1, 0, height))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if max_crop_area > 0.0 and (x1 - x0) * (y1 - y0) > max_crop_area:
+            continue
+        model = models.get(color)
+        if model is None:
+            continue
+        crop = bgr[y0:y1, x0:x1]
+        for candidate in _detect_color_proposals_full(crop, config, model):
+            raw.append(_translate_candidate(candidate, x0, y0))
+    return [
+        item for item in _deduplicate_candidates(raw)
+        if item.score >= config.min_score and item.color in valid_colors
+    ]
+
+
 def _deduplicate_candidates(
         candidates: Sequence[StripDetection]) -> List[StripDetection]:
     """合并同一单色段的重复检测，同时保留协议所需的相邻异色段。"""
