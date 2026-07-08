@@ -1,8 +1,17 @@
+# 第一台 USB 摄像头的单色灯带检测参数。
+#
+# 这里的颜色阈值只描述 R2 摄像头实际看到的颜色，不与 R1 发送端 RGB 值共享。
+# 当前有效数据色：RED / GREEN / BLUE / PURPLE。CYAN/YELLOW 暂不参与检测。
 calibrated: true
+
 processing:
-  scale: 0.4
+  # 新数据中的灯珠较小；0.75 是速度与召回的折中。
+  scale: 0.75
+
 color_assignment:
+  # 同一个像素只允许归属到最接近的一个颜色，减少蓝/紫、绿/青边界串色。
   exclusive_hue_owner: true
+
 colors:
   RED:
     hue_center: 2.46
@@ -18,32 +27,21 @@ colors:
       g: 0.45
     channel_max:
       b: 0.42
-  CYAN:
-    hue_center: 96.86
-    hue_radius: 20.14
-    min_saturation: 66.0
-    min_value: 42.0
-    channel_min:
-      b: 0.4
-      g: 0.284
-    channel_max:
-      r: 0.312
-      g: 0.55
-      b: 0.7
   BLUE:
     hue_center: 111.64
     hue_radius: 14.64
     min_saturation: 150.0
     min_value: 68.0
     channel_min:
-      b: 0.5
+      b: 0.50
     channel_max:
-      g: 0.4
+      g: 0.40
   PURPLE:
     hue_center: 150.96
     hue_radius: 21.96
-    min_saturation: 55.0
+    min_saturation: 90.0
     min_value: 73.0
+
 dots:
   min_blob_area: 1
   max_blob_area: 300
@@ -51,27 +49,66 @@ dots:
   min_blob_compactness: 0.05
   dog_sigma_small: 0.8
   dog_sigma_large: 2.6
-  min_dog_response: 5.0
-  max_points_per_color: 40
+  min_dog_response: 3.0
+  max_points_per_color: 80
+
 geometry:
-  min_dots: 6
-  min_length_pixels: 40
-  line_distance_pixels: 3.5
+  # 当前采集目标要求每段灯带必须由 5~6 个灯珠构成。
+  min_dots: 5
+  max_dots: 6
+  min_length_pixels: 16
+  line_distance_pixels: 4.5
   max_gap_ratio: 3.2
-  max_spacing_trend_error: 0.32
+  max_spacing_trend_error: 0.55
   min_coverage: 0.55
-  min_valley_contrast: 0.05
-  min_periodic_dot_quality: 0.38
-  min_periodic_color_quality: 0.45
+  min_valley_contrast: 0.02
+  # 对极小、颜色质量很高、线性残差很小的短链，允许暗谷不明显；
+  # 这是为远距离灯珠融合保留的窄例外。
+  low_valley_short_chain_floor: 0.12
+  low_valley_min_dot_quality: 0.65
+  low_valley_min_color_quality: 0.80
+  low_valley_max_residual: 0.75
+  min_periodic_dot_quality: 0.22
+  min_periodic_color_quality: 0.25
   continuous_min_area: 30
   continuous_min_length: 80
   continuous_min_aspect: 8.0
   continuous_min_color_quality: 0.75
+  # 远距离目标有时会融合成 20~45 像素的短彩色段；
+  # 该路径只补救这类小目标，不接受大面积彩色线。
+  merged_min_area: 60
+  merged_max_area: 220
+  merged_min_length: 22
+  merged_max_length: 45
+  merged_min_aspect: 6.0
+  merged_min_color_quality: 0.62
+  # 当前目标是远处 5 个以上小灯珠，过曝时会被颜色 mask 连成短条；
+  # 不能按旧规则把这种短条直接当作伪目标丢弃。
+  reject_short_continuous_bars: false
   max_pair_hypotheses: 200
   max_line_hypotheses: 5
+
 selection:
+  # 最终阈值先保持低值，由结构约束和 NONE 负样本验证控制误检。
   min_score: 0.04
   winner_margin: 1.2
+
+coarse_regions:
+  # 先用颜色点粗筛小区域，再对小区域跑完整结构检测。
+  enabled: true
+  scale: 0.6
+  # 白色天花灯/反光会产生大面积高亮区域；默认不把它们作为粗筛入口。
+  include_generic_color: false
+  min_saturation: 45
+  min_value: 35
+  min_area: 3
+  max_area: 5000
+  min_color_pixels: 5
+  min_color_fraction: 0.001
+  padding_pixels: 28
+  dilate_pixels: 13
+  max_regions: 32
+
 pairing:
   min_pair_score: 0.04
   max_angle_degrees: 18.0
@@ -81,3 +118,25 @@ pairing:
   min_length_ratio: 0.35
   max_length_ratio: 2.8
   max_pairs: 20
+
+three_segment:
+  # usb_rgb_1 三段灯带专用快速检测参数。
+  # 三段可能不完全贴近；因此先分别生成单色段，再按共线、三色全不同组合。
+  processing_scale: 0.5
+  max_single_candidates: 30
+  max_results: 8
+  min_three_score: 0.05
+  winner_margin: 1.2
+  max_angle_degrees: 30.0
+  max_cross_distance: 65.0
+  min_center_distance_ratio: 0.25
+  max_center_distance_ratio: 4.5
+  max_gap_ratio: 5.0
+  fast_dilate_pixels: 5
+  fast_min_component_area: 12
+  fast_max_component_area: 8000
+  fast_min_color_pixels: 5
+  fast_min_segment_length: 8.0
+  fast_min_union_aspect: 1.0
+  # 每种颜色只保留少量候选；ABA 两色三段不作为合法结果。
+  fast_max_segments_per_color: 2

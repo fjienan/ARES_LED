@@ -5,6 +5,8 @@
 - `capture_usb_rgb.py`：自动寻找外接 USB 摄像头，实时显示画面，并按固定间隔保存 JPG 原图。
 - `detect_usb_rgb.py`：自动寻找外接 USB 摄像头，运行当前 R2 单色检测算法，实时显示候选框，
   并在检测到阳性时保存原图。
+- `detect_usb_rgb_1_three_segment_live.py`：自动寻找外接 USB 摄像头，运行 `usb_rgb_1`
+  三段四色灯带检测算法，实时显示候选框，并在检测到三段阳性时保存原图。
 - `detect_usb_rgb_2_three_segment_live.py`：自动寻找外接 USB 摄像头，运行 `usb_rgb_2`
   三段四色灯带检测算法，实时显示候选框，并在检测到三段阳性时保存原图。
 
@@ -101,8 +103,23 @@ cd <仓库根目录>/camera_capture
 
 ## 实时三段四色灯带检测并保存阳性图片
 
-该脚本不启动 ROS，也不依赖 shared 协议包。它只针对 `usb_rgb_2`，先识别单段灯带，
+该脚本不启动 ROS，也不依赖 shared 协议包。它先识别单段灯带，
 再组合成“三段、基本共线、相邻不同色”的候选。
+
+摄像头 1：
+
+```bash
+cd <仓库根目录>/camera_capture
+/usr/bin/python3 ./detect_usb_rgb_1_three_segment_live.py
+```
+
+默认保存目录：
+
+```text
+<仓库根目录>/camera_capture_positive_usb_rgb_1_combined
+```
+
+摄像头 2：
 
 ```bash
 cd <仓库根目录>/camera_capture

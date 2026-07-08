@@ -29,6 +29,19 @@ from .profiles import (
 )
 
 
+def _read_camera_frame(capture):
+    """读取一帧，并屏蔽部分 USB 摄像头 MJPEG 流触发的 libjpeg 噪声。"""
+    stderr_fd = 2
+    saved_stderr_fd = os.dup(stderr_fd)
+    try:
+        with open(os.devnull, 'w', encoding='utf-8') as devnull:
+            os.dup2(devnull.fileno(), stderr_fd)
+            return capture.read()
+    finally:
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
+
+
 class LedStripReceiver(Node):
     """与协议无关的灯带检测器实时摄像头前端。"""
 
@@ -45,8 +58,8 @@ class LedStripReceiver(Node):
             os.environ.get('DISPLAY'))
         self.preview_scale = max(float(
             self.declare_parameter('preview_scale', 0.5).value), 0.05)
-        self.processing_scale = min(1.0, max(float(
-            self.declare_parameter('processing_scale', 1.0).value), 0.1))
+        processing_scale_param = float(
+            self.declare_parameter('processing_scale', 0.0).value)
         self.save_positive_images = bool(
             self.declare_parameter('save_positive_images', True).value)
         capture_dir = str(self.declare_parameter(
@@ -71,6 +84,13 @@ class LedStripReceiver(Node):
             Path(configured_detector or default_detector).expanduser(),
             profile))
         self.config = self.classifier.load_config(config_path)
+        # processing_scale <= 0 表示跟随 detector.yaml，保证实时节点、离线评估、
+        # 非 ROS 实时脚本使用同一套检测尺度；显式传入正数时才覆盖。
+        self.processing_scale = (
+            min(1.0, max(processing_scale_param, 0.1))
+            if processing_scale_param > 0.0
+            else min(1.0, max(float(self.config.processing_scale), 0.1))
+        )
         protocol_config = str(self.declare_parameter(
             'protocol_config', '').value)
         self.protocol = FixedColorProtocol(
@@ -99,12 +119,13 @@ class LedStripReceiver(Node):
         self.get_logger().info(
             f'R2 LED vision ready: profile={profile}, camera={self.device}, '
             f'config={config_path}, '
+            f'processing_scale={self.processing_scale:g}, '
             f'colors={[item.name for item in self.config.colors]}, '
             f'output={output_topic}, confirm={self.confirmation_required}/'
             f'{self.confirmation_window}')
 
     def _scan(self) -> None:
-        ok, frame = self.capture.read()
+        ok, frame = _read_camera_frame(self.capture)
         if not ok or frame is None:
             self.get_logger().warning('camera frame unavailable')
             return
@@ -236,7 +257,7 @@ class LedStripReceiver(Node):
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             capture.set(cv2.CAP_PROP_FPS, fps)
-            ok, frame = capture.read()
+            ok, frame = _read_camera_frame(capture)
             if ok and frame is not None and frame.ndim == 3 and frame.shape[2] == 3:
                 return capture, device
             failures.append(device)

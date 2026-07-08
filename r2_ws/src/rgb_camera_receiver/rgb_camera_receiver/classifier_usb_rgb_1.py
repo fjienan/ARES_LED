@@ -47,15 +47,38 @@ class DetectorConfig:
     max_spacing_trend_error: float = 0.32
     min_coverage: float = 0.55
     min_valley_contrast: float = 0.10
+    low_valley_short_chain_floor: float = 0.0
+    low_valley_min_dot_quality: float = 0.65
+    low_valley_min_color_quality: float = 0.80
+    low_valley_max_residual: float = 0.75
     min_periodic_dot_quality: float = 0.38
     min_periodic_color_quality: float = 0.45
     continuous_min_area: int = 30
     continuous_min_length: float = 80.0
     continuous_min_aspect: float = 8.0
     continuous_min_color_quality: float = 0.75
+    merged_min_area: int = 60
+    merged_max_area: int = 220
+    merged_min_length: float = 22.0
+    merged_max_length: float = 45.0
+    merged_min_aspect: float = 6.0
+    merged_min_color_quality: float = 0.62
+    reject_short_continuous_bars: bool = True
     min_score: float = 0.04
     winner_margin: float = 1.0
     exclusive_hue_owner: bool = True
+    coarse_regions: bool = False
+    coarse_processing_scale: float = 1.0
+    coarse_include_generic_color: bool = False
+    coarse_min_saturation: float = 45.0
+    coarse_min_value: float = 35.0
+    coarse_min_area: int = 3
+    coarse_max_area: int = 6000
+    coarse_min_color_pixels: int = 4
+    coarse_min_color_fraction: float = 0.001
+    coarse_padding_pixels: int = 24
+    coarse_dilate_pixels: int = 11
+    coarse_max_regions: int = 48
 
 
 @dataclass(frozen=True)
@@ -155,6 +178,7 @@ def load_config(path: str) -> DetectorConfig:
     selection = raw.get('selection', {})
     processing = raw.get('processing', {})
     color_assignment = raw.get('color_assignment', {})
+    coarse = raw.get('coarse_regions', {})
     return DetectorConfig(
         colors=colors,
         processing_scale=float(np.clip(
@@ -180,6 +204,14 @@ def load_config(path: str) -> DetectorConfig:
         min_coverage=float(geometry.get('min_coverage', 0.55)),
         min_valley_contrast=float(
             geometry.get('min_valley_contrast', 0.10)),
+        low_valley_short_chain_floor=float(
+            geometry.get('low_valley_short_chain_floor', 0.0)),
+        low_valley_min_dot_quality=float(
+            geometry.get('low_valley_min_dot_quality', 0.65)),
+        low_valley_min_color_quality=float(
+            geometry.get('low_valley_min_color_quality', 0.80)),
+        low_valley_max_residual=float(
+            geometry.get('low_valley_max_residual', 0.75)),
         min_periodic_dot_quality=float(
             geometry.get('min_periodic_dot_quality', 0.38)),
         min_periodic_color_quality=float(
@@ -192,10 +224,34 @@ def load_config(path: str) -> DetectorConfig:
             geometry.get('continuous_min_aspect', 8.0)),
         continuous_min_color_quality=float(
             geometry.get('continuous_min_color_quality', 0.75)),
+        merged_min_area=int(geometry.get('merged_min_area', 60)),
+        merged_max_area=int(geometry.get('merged_max_area', 220)),
+        merged_min_length=float(geometry.get('merged_min_length', 22.0)),
+        merged_max_length=float(geometry.get('merged_max_length', 45.0)),
+        merged_min_aspect=float(geometry.get('merged_min_aspect', 6.0)),
+        merged_min_color_quality=float(
+            geometry.get('merged_min_color_quality', 0.62)),
+        reject_short_continuous_bars=bool(
+            geometry.get('reject_short_continuous_bars', True)),
         min_score=float(selection.get('min_score', 0.04)),
         winner_margin=float(selection.get('winner_margin', 1.0)),
         exclusive_hue_owner=bool(
             color_assignment.get('exclusive_hue_owner', True)),
+        coarse_regions=bool(coarse.get('enabled', False)),
+        coarse_processing_scale=float(np.clip(
+            coarse.get('scale', 1.0), 0.2, 1.0)),
+        coarse_include_generic_color=bool(
+            coarse.get('include_generic_color', False)),
+        coarse_min_saturation=float(coarse.get('min_saturation', 45)),
+        coarse_min_value=float(coarse.get('min_value', 35)),
+        coarse_min_area=int(coarse.get('min_area', 3)),
+        coarse_max_area=int(coarse.get('max_area', 6000)),
+        coarse_min_color_pixels=int(coarse.get('min_color_pixels', 4)),
+        coarse_min_color_fraction=float(coarse.get(
+            'min_color_fraction', 0.001)),
+        coarse_padding_pixels=int(coarse.get('padding_pixels', 24)),
+        coarse_dilate_pixels=int(coarse.get('dilate_pixels', 11)),
+        coarse_max_regions=int(coarse.get('max_regions', 48)),
     )
 
 
@@ -316,6 +372,38 @@ def color_masks(
     return masks
 
 
+def _basic_color_mask(
+        hsv: np.ndarray,
+        bgr: np.ndarray,
+        model: ColorModel) -> np.ndarray:
+    """快速单色阈值，用于粗筛；不计算颜色之间的互斥归属。"""
+    low = model.hue_center - model.hue_radius
+    high = model.hue_center + model.hue_radius
+    saturation = int(np.clip(model.min_saturation, 0, 255))
+    value = int(np.clip(model.min_value, 0, 255))
+    if low < 0:
+        first = cv2.inRange(
+            hsv, (0, saturation, value),
+            (int(np.floor(high)), 255, 255))
+        second = cv2.inRange(
+            hsv, (int(np.ceil(180 + low)), saturation, value),
+            (179, 255, 255))
+        mask = cv2.bitwise_or(first, second)
+    elif high >= 180:
+        first = cv2.inRange(
+            hsv, (int(np.ceil(low)), saturation, value),
+            (179, 255, 255))
+        second = cv2.inRange(
+            hsv, (0, saturation, value),
+            (int(np.floor(high - 180)), 255, 255))
+        mask = cv2.bitwise_or(first, second)
+    else:
+        mask = cv2.inRange(
+            hsv, (int(np.ceil(low)), saturation, value),
+            (int(np.floor(high)), 255, 255))
+    return mask.astype(bool) & _channel_constraints_mask(bgr, model)
+
+
 def _point_color_quality(
         hsv: np.ndarray,
         bgr: np.ndarray,
@@ -335,10 +423,15 @@ def _point_color_quality(
     yy, xx = np.ogrid[y0 - y:y1 - y, x0 - x:x1 - x]
     disk = xx * xx + yy * yy <= radius * radius
     pixels = patch[disk]
-    bright = pixels[pixels[:, 2] >= model.min_value]
+    bgr_pixels = bgr_patch[disk]
+    bright_mask = pixels[:, 2] >= model.min_value
+    bright = pixels[bright_mask]
+    bright_bgr = bgr_pixels[bright_mask]
     if len(bright) == 0:
         return 0.0
-    saturated = bright[bright[:, 1] >= model.min_saturation]
+    saturated_mask = bright[:, 1] >= model.min_saturation
+    saturated = bright[saturated_mask]
+    saturated_bgr = bright_bgr[saturated_mask]
     if len(saturated) == 0:
         return 0.0
     distances = np.stack([
@@ -351,7 +444,7 @@ def _point_color_quality(
     own = (nearest == own_index) & (distances[:, own_index] <= 1.0)
     if not np.any(own):
         return 0.0
-    channel_quality = _channel_constraints_quality(bgr_patch[disk][own], model)
+    channel_quality = _channel_constraints_quality(saturated_bgr[own], model)
     if channel_quality <= 0.0:
         return 0.0
     hue_quality = 1.0 - float(np.median(
@@ -429,7 +522,8 @@ def _extract_light_points(
         local_maxima = (
             (smooth >= cv2.dilate(
                 smooth, np.ones((7, 7), np.uint8)) - 1e-4) &
-            (dog >= config.min_dog_response)
+            (dog >= config.min_dog_response) &
+            mask
         )
         peak_count, _, _, peak_centroids = cv2.connectedComponentsWithStats(
             local_maxima.astype(np.uint8), 8)
@@ -590,6 +684,26 @@ def _component_light_points(
     return points[:config.max_points_per_color]
 
 
+def _merge_light_points(
+        first: Sequence[_LightPoint],
+        second: Sequence[_LightPoint],
+        limit: int) -> List[_LightPoint]:
+    """合并两种点提取路径的结果，避免同一灯珠重复进入直线拟合。"""
+    points = sorted(
+        [*first, *second], key=lambda item: item.quality, reverse=True)
+    merged: List[_LightPoint] = []
+    for point in points:
+        if any(
+                np.linalg.norm(point.center - old.center) <
+                max(2.5, min(point.radius + old.radius, 4.0))
+                for old in merged):
+            continue
+        merged.append(point)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
 def _continuous_proposals(
         components: Sequence[_ColorComponent],
         color: str,
@@ -636,6 +750,103 @@ def _continuous_proposals(
             mode='continuous',
         ))
     return proposals
+
+
+def _merged_component_proposals(
+        components: Sequence[_ColorComponent],
+        color: str,
+        config: DetectorConfig) -> List[StripDetection]:
+    """补救远距离灯珠融合成短彩色段时无法恢复足够峰值的情况。"""
+    proposals = []
+    for component in components:
+        if component.area < config.merged_min_area:
+            continue
+        if component.area > config.merged_max_area:
+            continue
+        if component.length < config.merged_min_length:
+            continue
+        if component.length > config.merged_max_length:
+            continue
+        if component.aspect < config.merged_min_aspect:
+            continue
+        if component.color_quality < config.merged_min_color_quality:
+            continue
+        aspect_quality = float(np.clip(
+            (component.aspect - config.merged_min_aspect) /
+            max(10.0 - config.merged_min_aspect, 1e-6),
+            0.0, 1.0))
+        length_quality = float(np.clip(
+            (component.length - config.merged_min_length) /
+            max(config.merged_max_length - config.merged_min_length, 1e-6),
+            0.0, 1.0))
+        score = float(
+            0.22 * component.color_quality *
+            (0.45 + 0.55 * aspect_quality) *
+            (0.35 + 0.65 * np.sqrt(max(length_quality, 0.0))))
+        proposals.append(StripDetection(
+            color=color,
+            confidence=float(np.sqrt(max(
+                component.color_quality *
+                (0.45 + 0.55 * aspect_quality), 0.0))),
+            score=score,
+            corners=component.corners,
+            dot_count=max(
+                config.min_dots,
+                int(round(component.length / max(component.width * 1.5, 1.0)))),
+            length=component.length,
+            residual=component.width * 0.5,
+            spacing_cv=0.0,
+            line_quality=aspect_quality,
+            dot_quality=0.0,
+            periodic_quality=length_quality,
+            color_quality=component.color_quality,
+            valley_quality=0.0,
+            peak_centers=None,
+            mode='merged_component',
+        ))
+    return proposals
+
+
+def _detect_model_proposals(
+        hsv: np.ndarray,
+        bgr: np.ndarray,
+        smooth: np.ndarray,
+        dog: np.ndarray,
+        mask: np.ndarray,
+        model: ColorModel,
+        config: DetectorConfig) -> List[StripDetection]:
+    """在已知颜色 mask 内执行完整结构检测。"""
+    raw: List[StripDetection] = []
+    components = _extract_color_components(
+        hsv, bgr, mask, model, config)
+    continuous = _continuous_proposals(
+        components, model.name, config)
+    raw.extend(continuous)
+    if continuous:
+        return raw
+    raw.extend(_merged_component_proposals(
+        components, model.name, config))
+    points = _merge_light_points(
+        _component_light_points(components, dog, config),
+        _extract_light_points(
+            hsv, bgr, mask, smooth, dog, model, config,
+            recover_merged=True),
+        config.max_points_per_color)
+    for indexes in _line_hypotheses(points, config):
+        candidate = _fit_candidate(
+            points, indexes, bgr, dog, config, model.name)
+        if candidate is None:
+            continue
+        if candidate.dot_quality < config.min_periodic_dot_quality:
+            continue
+        if candidate.color_quality < config.min_periodic_color_quality:
+            continue
+        if (
+                config.reject_short_continuous_bars and
+                _is_short_continuous_bar(candidate, components, config)):
+            continue
+        raw.append(candidate)
+    return raw
 
 
 def _candidate_axis(candidate: StripDetection) -> Tuple[np.ndarray, np.ndarray]:
@@ -978,7 +1189,25 @@ def _fit_candidate(
     pair_peaks = np.minimum(peak_response[:-1], peak_response[1:])
     contrasts = (pair_peaks - valley_response) / np.maximum(pair_peaks, 1.0)
     valley_contrast = float(np.median(np.clip(contrasts, 0.0, 1.0)))
-    if valley_contrast < config.min_valley_contrast:
+    pre_dot_quality = float(np.median(
+        [item.quality for item in selected_points]))
+    pre_color_values = np.asarray(
+        [item.color_quality for item in selected_points], dtype=np.float32)
+    pre_color_quality = float(np.median(pre_color_values))
+    pre_color_consistency = float(
+        np.count_nonzero(pre_color_values >= pre_color_quality * 0.65) /
+        len(pre_color_values))
+    pre_color_quality *= pre_color_consistency
+    allow_low_valley_short_chain = (
+        config.low_valley_short_chain_floor > 0.0 and
+        len(selected) <= 4 and
+        residual <= config.low_valley_max_residual and
+        pre_dot_quality >= config.low_valley_min_dot_quality and
+        pre_color_quality >= config.low_valley_min_color_quality
+    )
+    if (
+            valley_contrast < config.min_valley_contrast and
+            not allow_low_valley_short_chain):
         return None
 
     line_quality = float(np.exp(
@@ -988,19 +1217,15 @@ def _fit_candidate(
                    max(config.max_spacing_trend_error, 1e-6))))
     periodic_quality = float(np.clip(
         trend_quality * np.sqrt(coverage), 0.0, 1.0))
-    dot_quality = float(np.median(
-        [item.quality for item in selected_points]))
-    color_values = np.asarray(
-        [item.color_quality for item in selected_points], dtype=np.float32)
-    color_quality = float(np.median(color_values))
-    color_consistency = float(
-        np.count_nonzero(color_values >= color_quality * 0.65) /
-        len(color_values))
-    color_quality *= color_consistency
+    dot_quality = pre_dot_quality
+    color_quality = pre_color_quality
     valley_quality = float(np.clip(
         (valley_contrast - config.min_valley_contrast) /
         max(0.55 - config.min_valley_contrast, 1e-6),
         0.0, 1.0))
+    if allow_low_valley_short_chain:
+        valley_quality = max(
+            valley_quality, config.low_valley_short_chain_floor)
     # 此处有意使用乘法：没有独立灯珠的彩色线，或只有彩色边缘的周期性白色结构，
     # 其得分必须保持较低。
     score = float(
@@ -1083,7 +1308,234 @@ def _same_physical_strip(first: StripDetection, second: StripDetection) -> bool:
     return gap <= max(25.0, min(first.length, second.length) * 2.50)
 
 
-def detect_proposals(
+def _translate_candidate(
+        candidate: StripDetection,
+        offset_x: int,
+        offset_y: int) -> StripDetection:
+    offset = np.array((offset_x, offset_y), dtype=np.float32)
+    peaks = (
+        None if candidate.peak_centers is None
+        else candidate.peak_centers + offset
+    )
+    return StripDetection(
+        color=candidate.color,
+        confidence=candidate.confidence,
+        score=candidate.score,
+        corners=candidate.corners + offset,
+        dot_count=candidate.dot_count,
+        length=candidate.length,
+        residual=candidate.residual,
+        spacing_cv=candidate.spacing_cv,
+        line_quality=candidate.line_quality,
+        dot_quality=candidate.dot_quality,
+        periodic_quality=candidate.periodic_quality,
+        color_quality=candidate.color_quality,
+        valley_quality=candidate.valley_quality,
+        peak_centers=peaks,
+        mode=candidate.mode,
+    )
+
+
+def _merge_rectangles(
+        rectangles: Sequence[Tuple[int, int, int, int]],
+        image_shape: Tuple[int, int]) -> List[Tuple[int, int, int, int]]:
+    """合并重叠粗框，减少重复精检测。"""
+    if not rectangles:
+        return []
+    height, width = image_shape
+    ordered = sorted(rectangles, key=lambda item: (item[1], item[0]))
+    merged: List[Tuple[int, int, int, int]] = []
+    for rect in ordered:
+        x0, y0, x1, y1 = rect
+        x0 = int(np.clip(x0, 0, width))
+        x1 = int(np.clip(x1, 0, width))
+        y0 = int(np.clip(y0, 0, height))
+        y1 = int(np.clip(y1, 0, height))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        changed = True
+        current = (x0, y0, x1, y1)
+        while changed:
+            changed = False
+            remaining = []
+            cx0, cy0, cx1, cy1 = current
+            for old in merged:
+                ox0, oy0, ox1, oy1 = old
+                overlap = not (
+                    cx1 < ox0 or ox1 < cx0 or cy1 < oy0 or oy1 < cy0)
+                if overlap:
+                    current = (
+                        min(cx0, ox0),
+                        min(cy0, oy0),
+                        max(cx1, ox1),
+                        max(cy1, oy1),
+                    )
+                    changed = True
+                    cx0, cy0, cx1, cy1 = current
+                else:
+                    remaining.append(old)
+            merged = remaining
+        merged.append(current)
+    return merged
+
+
+def _coarse_region_rectangles(
+        hsv: np.ndarray,
+        masks: Mapping[str, np.ndarray],
+        dog: np.ndarray,
+        config: DetectorConfig) -> List[Tuple[int, int, int, int]]:
+    """先找少量彩色高频小区域，再把精检测限制到这些区域内。"""
+    if not config.coarse_regions:
+        return []
+    if not masks:
+        return []
+    color_union = np.zeros(hsv.shape[:2], dtype=bool)
+    for mask in masks.values():
+        color_union |= mask
+    seed = color_union.copy()
+    if config.coarse_include_generic_color:
+        generic_color = (
+            (hsv[:, :, 1] >= config.coarse_min_saturation) &
+            (hsv[:, :, 2] >= config.coarse_min_value) &
+            (dog >= max(config.min_dog_response * 0.5, 1.0))
+        )
+        seed |= generic_color
+    if not np.any(seed):
+        return []
+
+    kernel_size = max(1, int(config.coarse_dilate_pixels))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    merged = cv2.dilate(seed.astype(np.uint8), kernel, iterations=1)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(merged, 8)
+    ranked: List[Tuple[float, Tuple[int, int, int, int]]] = []
+    height, width = hsv.shape[:2]
+    padding = max(0, int(config.coarse_padding_pixels))
+    for label in range(1, count):
+        x, y, rect_width, rect_height, area = stats[label]
+        if area < config.coarse_min_area or area > config.coarse_max_area:
+            continue
+        component = labels[y:y + rect_height, x:x + rect_width] == label
+        original_color_pixels = int(np.count_nonzero(
+            color_union[y:y + rect_height, x:x + rect_width] & component))
+        if original_color_pixels < config.coarse_min_color_pixels:
+            continue
+        color_fraction = original_color_pixels / max(float(area), 1.0)
+        if color_fraction < config.coarse_min_color_fraction:
+            continue
+        aspect = max(rect_width, rect_height) / max(
+            min(rect_width, rect_height), 1)
+        rank = float(original_color_pixels) * np.sqrt(max(aspect, 1.0))
+        ranked.append((
+            rank,
+            (
+                max(0, x - padding),
+                max(0, y - padding),
+                min(width, x + rect_width + padding),
+                min(height, y + rect_height + padding),
+            ),
+        ))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    rectangles = [
+        item[1] for item in ranked[:max(1, config.coarse_max_regions)]
+    ]
+    return _merge_rectangles(rectangles, hsv.shape[:2])
+
+
+def _coarse_region_rectangles_by_color(
+        hsv: np.ndarray,
+        bgr: np.ndarray,
+        dog: np.ndarray,
+        config: DetectorConfig) -> List[Tuple[str, Tuple[int, int, int, int]]]:
+    """返回按颜色标记的粗框，避免每个 crop 重复检测所有颜色。"""
+    if not config.coarse_regions:
+        return []
+    height, width = hsv.shape[:2]
+    kernel_size = max(1, int(config.coarse_dilate_pixels))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    padding = max(0, int(config.coarse_padding_pixels))
+    generic_color = None
+    if config.coarse_include_generic_color:
+        generic_color = (
+            (hsv[:, :, 1] >= config.coarse_min_saturation) &
+            (hsv[:, :, 2] >= config.coarse_min_value) &
+            (dog >= max(config.min_dog_response * 0.5, 1.0))
+        )
+
+    ranked: List[Tuple[float, str, Tuple[int, int, int, int]]] = []
+    for model in config.colors:
+        color_seed = _basic_color_mask(hsv, bgr, model)
+        seed = color_seed.copy()
+        if generic_color is not None:
+            seed |= generic_color
+        if not np.any(seed):
+            continue
+        merged = cv2.dilate(seed.astype(np.uint8), kernel, iterations=1)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(merged, 8)
+        for label in range(1, count):
+            x, y, rect_width, rect_height, area = stats[label]
+            if area < config.coarse_min_area or area > config.coarse_max_area:
+                continue
+            component = labels[y:y + rect_height, x:x + rect_width] == label
+            original_color_pixels = int(np.count_nonzero(
+                color_seed[y:y + rect_height, x:x + rect_width] &
+                component))
+            if original_color_pixels < config.coarse_min_color_pixels:
+                continue
+            color_fraction = original_color_pixels / max(float(area), 1.0)
+            if color_fraction < config.coarse_min_color_fraction:
+                continue
+            aspect = max(rect_width, rect_height) / max(
+                min(rect_width, rect_height), 1)
+            rank = float(original_color_pixels) * np.sqrt(max(aspect, 1.0))
+            ranked.append((
+                rank,
+                model.name,
+                (
+                    max(0, x - padding),
+                    max(0, y - padding),
+                    min(width, x + rect_width + padding),
+                    min(height, y + rect_height + padding),
+                ),
+            ))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    by_color: Dict[str, List[Tuple[int, int, int, int]]] = {}
+    for _, color, rect in ranked[:max(1, config.coarse_max_regions)]:
+        by_color.setdefault(color, []).append(rect)
+
+    rectangles: List[Tuple[str, Tuple[int, int, int, int]]] = []
+    for color, rects in by_color.items():
+        for rect in _merge_rectangles(rects, hsv.shape[:2]):
+            rectangles.append((color, rect))
+    return rectangles
+
+
+def _detect_color_proposals_full(
+        bgr: np.ndarray,
+        config: DetectorConfig,
+        model: ColorModel) -> List[StripDetection]:
+    """只检测单个颜色，供粗筛 crop 使用。"""
+    if bgr is None or bgr.size == 0:
+        return []
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    value = hsv[:, :, 2].astype(np.float32)
+    smooth = cv2.GaussianBlur(
+        value, (0, 0), config.dog_sigma_small)
+    broad = cv2.GaussianBlur(
+        value, (0, 0), config.dog_sigma_large)
+    dog = smooth - broad
+    mask = color_masks(hsv, bgr, config)[model.name]
+    return _detect_model_proposals(
+        hsv, bgr, smooth, dog, mask, model, config)
+
+
+def _detect_proposals_full(
         bgr: np.ndarray,
         config: DetectorConfig) -> List[StripDetection]:
     """返回应用最终分数阈值前结构有效的候选。"""
@@ -1099,26 +1551,64 @@ def detect_proposals(
     masks = color_masks(hsv, bgr, config)
     raw: List[StripDetection] = []
     for model in config.colors:
-        components = _extract_color_components(
-            hsv, bgr, masks[model.name], model, config)
-        continuous = _continuous_proposals(
-            components, model.name, config)
-        raw.extend(continuous)
-        if continuous:
+        raw.extend(_detect_model_proposals(
+            hsv, bgr, smooth, dog, masks[model.name], model, config))
+    return _deduplicate_candidates(raw)
+
+
+def detect_proposals(
+        bgr: np.ndarray,
+        config: DetectorConfig) -> List[StripDetection]:
+    """返回应用最终分数阈值前结构有效的候选。"""
+    if bgr is None or bgr.size == 0:
+        return []
+    if not config.coarse_regions:
+        return _detect_proposals_full(bgr, config)
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    coarse_bgr = bgr
+    coarse_scale = config.coarse_processing_scale
+    if coarse_scale < 1.0:
+        coarse_bgr = cv2.resize(
+            bgr, None, fx=coarse_scale, fy=coarse_scale,
+            interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(coarse_bgr, cv2.COLOR_BGR2HSV)
+    if config.coarse_include_generic_color:
+        value = hsv[:, :, 2].astype(np.float32)
+        smooth = cv2.GaussianBlur(
+            value, (0, 0), config.dog_sigma_small)
+        broad = cv2.GaussianBlur(
+            value, (0, 0), config.dog_sigma_large)
+        dog = smooth - broad
+    else:
+        dog = np.zeros(hsv.shape[:2], dtype=np.float32)
+    rectangles = _coarse_region_rectangles_by_color(
+        hsv, coarse_bgr, dog, config)
+    if not rectangles:
+        return []
+
+    models = {model.name: model for model in config.colors}
+    height, width = bgr.shape[:2]
+    raw: List[StripDetection] = []
+    for color, (x0, y0, x1, y1) in rectangles:
+        if coarse_scale < 1.0:
+            inverse = 1.0 / coarse_scale
+            x0 = int(np.floor(x0 * inverse))
+            y0 = int(np.floor(y0 * inverse))
+            x1 = int(np.ceil(x1 * inverse))
+            y1 = int(np.ceil(y1 * inverse))
+        x0 = int(np.clip(x0, 0, width))
+        x1 = int(np.clip(x1, 0, width))
+        y0 = int(np.clip(y0, 0, height))
+        y1 = int(np.clip(y1, 0, height))
+        if x1 <= x0 or y1 <= y0:
             continue
-        points = _component_light_points(components, dog, config)
-        for indexes in _line_hypotheses(points, config):
-            candidate = _fit_candidate(
-                points, indexes, bgr, dog, config, model.name)
-            if candidate is None:
-                continue
-            if candidate.dot_quality < config.min_periodic_dot_quality:
-                continue
-            if candidate.color_quality < config.min_periodic_color_quality:
-                continue
-            if _is_short_continuous_bar(candidate, components, config):
-                continue
-            raw.append(candidate)
+        crop = bgr[y0:y1, x0:x1]
+        model = models.get(color)
+        if model is None:
+            continue
+        for candidate in _detect_color_proposals_full(crop, config, model):
+            raw.append(_translate_candidate(candidate, x0, y0))
     return _deduplicate_candidates(raw)
 
 

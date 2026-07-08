@@ -77,6 +77,19 @@ def device_label(device: str) -> str:
     return f'{device} -> {real} ({name})'
 
 
+def read_camera_frame(capture):
+    """读取一帧，并屏蔽部分 USB 摄像头 MJPEG 流触发的 libjpeg 噪声。"""
+    stderr_fd = 2
+    saved_stderr_fd = os.dup(stderr_fd)
+    try:
+        with open(os.devnull, 'w', encoding='utf-8') as devnull:
+            os.dup2(devnull.fileno(), stderr_fd)
+            return capture.read()
+    finally:
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
+
+
 def camera_candidates(device: str):
     if device.lower() != 'auto':
         if is_integrated_camera(device):
@@ -120,7 +133,7 @@ def open_camera(device: str, width: int, height: int, fps: float):
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         capture.set(cv2.CAP_PROP_FPS, fps)
         capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        ok, frame = capture.read()
+        ok, frame = read_camera_frame(capture)
         if ok and frame is not None:
             if device.lower() != 'auto':
                 return capture, candidate
@@ -165,8 +178,12 @@ def parse_args():
     parser.add_argument(
         '--interval', type=float, default=2.0,
         help='save interval in seconds, default: 2')
-    parser.add_argument('--width', type=int, default=1280)
-    parser.add_argument('--height', type=int, default=720)
+    parser.add_argument(
+        '--width', type=int,
+        help='requested frame width; default: 2560 for camera 1, 1280 for camera 2')
+    parser.add_argument(
+        '--height', type=int,
+        help='requested frame height; default: 1440 for camera 1, 720 for camera 2')
     parser.add_argument('--fps', type=float, default=30.0)
     parser.add_argument('--jpeg-quality', type=int, default=95)
     parser.add_argument(
@@ -183,6 +200,10 @@ def main():
         raise SystemExit('--jpeg-quality must be in 1..100')
 
     camera_key = f'usb_rgb_{args.camera_id}'
+    default_width = 2560 if args.camera_id == 1 else 1280
+    default_height = 1440 if args.camera_id == 1 else 720
+    width = args.width if args.width is not None else default_width
+    height = args.height if args.height is not None else default_height
     default_output = (
         Path(__file__).resolve().parents[1] /
         'camera_data' / camera_key / 'raw')
@@ -190,7 +211,7 @@ def main():
     prefix = args.prefix if args.prefix else camera_key
     output_dir.mkdir(parents=True, exist_ok=True)
     capture, selected_device = open_camera(
-        args.device, args.width, args.height, args.fps)
+        args.device, width, height, args.fps)
 
     actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -208,7 +229,7 @@ def main():
     next_save = time.monotonic()
     try:
         while True:
-            ok, frame = capture.read()
+            ok, frame = read_camera_frame(capture)
             if not ok or frame is None:
                 print('warning: failed to read a camera frame')
                 time.sleep(0.05)

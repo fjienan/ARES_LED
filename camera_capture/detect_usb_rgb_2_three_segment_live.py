@@ -16,7 +16,7 @@ import time
 
 import cv2
 
-from capture_usb_rgb import camera_name, open_camera
+from capture_usb_rgb import camera_name, open_camera, read_camera_frame
 from detect_usb_rgb_2_three_segment import (
     REPO_ROOT,
     R2_PACKAGE,
@@ -177,7 +177,7 @@ def main():
     last_label = None
     try:
         while True:
-            ok, frame = capture.read()
+            ok, frame = read_camera_frame(capture)
             if not ok or frame is None:
                 print('warning: failed to read a camera frame')
                 time.sleep(0.05)

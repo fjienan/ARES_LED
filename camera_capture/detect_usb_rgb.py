@@ -9,7 +9,7 @@ import time
 
 import cv2
 
-from capture_usb_rgb import camera_name, open_camera
+from capture_usb_rgb import camera_name, open_camera, read_camera_frame
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -29,8 +29,12 @@ def parse_args():
     parser.add_argument(
         '--device', default='auto',
         help='auto、/dev/videoX 或 /dev/v4l/by-id/...；默认 auto')
-    parser.add_argument('--width', type=int, default=1280)
-    parser.add_argument('--height', type=int, default=720)
+    parser.add_argument(
+        '--width', type=int,
+        help='请求图像宽度；默认 camera 1 为 2560，camera 2 为 1280')
+    parser.add_argument(
+        '--height', type=int,
+        help='请求图像高度；默认 camera 1 为 1440，camera 2 为 720')
     parser.add_argument('--fps', type=float, default=30.0)
     parser.add_argument(
         '--processing-scale', type=float,
@@ -120,6 +124,10 @@ def main():
         raise SystemExit('--preview-scale must be > 0')
 
     profile = f'usb_rgb_{args.camera_id}'
+    default_width = 2560 if args.camera_id == 1 else 1280
+    default_height = 1440 if args.camera_id == 1 else 720
+    width = args.width if args.width is not None else default_width
+    height = args.height if args.height is not None else default_height
     classifier, config, config_path = load_detector(profile)
     processing_scale = (
         float(args.processing_scale)
@@ -137,7 +145,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
     capture, selected_device = open_camera(
-        args.device, args.width, args.height, args.fps)
+        args.device, width, height, args.fps)
     print(f'profile: {profile}')
     print(f'detector: {config_path}')
     print(f'device: {selected_device} ({camera_name(selected_device)})')
@@ -159,7 +167,7 @@ def main():
     last_label = None
     try:
         while True:
-            ok, frame = capture.read()
+            ok, frame = read_camera_frame(capture)
             if not ok or frame is None:
                 print('warning: failed to read a camera frame')
                 time.sleep(0.05)
