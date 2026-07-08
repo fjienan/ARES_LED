@@ -8,12 +8,23 @@ rgb_led_sender:
     # 正常控制 WLED 时保持为 0.0。查询或详细回复可能占满串口缓冲区，
     # 导致后续写入不可靠。
     serial_timeout_sec: 0.0
-    # 发送端使用的两个逻辑协议段索引。
-    groups: [0, 1]
     # WLED 所管理的 WS2811 可寻址分段（像素）数量。
     pixel_count: 11
-    # WLED 全局亮度，范围为 0..255。
-    brightness: 6.0
+    # 物理段到 WLED 像素范围的映射。默认每个物理段对应一个可寻址像素。
+    segment_starts: [0, 1, 2, 3, 4, 5]
+    segment_stops: [1, 2, 3, 4, 5, 6]
+    # 低亮度组三段显示同一个协议码，亮度较低，方便近距离相机观看。
+    low_segments: [0, 1, 2]
+    low_brightness: 6.0
+    low_reverse_order: false
+    # 高亮度组三段显示同一个协议码，亮度较高，方便远距离相机观看。
+    high_segments: [3, 4, 5]
+    high_brightness: 60.0
+    high_reverse_order: false
+    # segment_bri 使用 WLED 每段 bri；如固件不支持，可改为 rgb_scale。
+    brightness_mode: segment_bri
+    # 使用每段 bri 时，全局主亮度保持 255，实际亮度由各段 bri 控制。
+    wled_master_brightness: 255.0
     retry_period_sec: 0.5
     # R1 物理输出的 RGB 配置，与 R2 摄像头观测值无关。
     colors_config: ""

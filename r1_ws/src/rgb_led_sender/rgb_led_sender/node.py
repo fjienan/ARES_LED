@@ -11,7 +11,7 @@ from std_msgs.msg import Int32
 
 from rgb_comm_protocol import FixedColorProtocol
 
-from .mapping import build_wled_state_json
+from .mapping import build_triplet_segment_specs, build_wled_state_json
 
 
 _BAUD_RATES = {
@@ -106,25 +106,49 @@ class RgbLedSender(Node):
         super().__init__('rgb_led_sender')
         topic = self.declare_parameter('input_topic', '/aruco_comm/tx_id').value
         self.transport = str(self.declare_parameter('transport', 'serial').value).lower()
-        self.groups = [int(v) for v in self.declare_parameter('groups', [0, 1]).value]
-        self.brightness = float(self.declare_parameter('brightness', 0.2).value)
         self.pixel_count = int(self.declare_parameter('pixel_count', 11).value)
         retry_period = float(self.declare_parameter('retry_period_sec', 0.5).value)
-
-        if len(self.groups) != 2:
-            raise ValueError('groups must contain exactly two LED group indexes')
-        if any(group < 0 for group in self.groups):
-            raise ValueError('groups must contain only non-negative LED group indexes')
-        if len(set(self.groups)) != len(self.groups):
-            raise ValueError('groups must contain two distinct LED group indexes')
-        if self.pixel_count < 2:
-            raise ValueError('pixel_count must be at least 2')
+        if self.pixel_count <= 0:
+            raise ValueError('pixel_count must be positive')
 
         default_colors = os.path.join(
             get_package_share_directory('rgb_led_sender'), 'config', 'colors.yaml')
         colors_path = str(self.declare_parameter(
             'colors_config', default_colors).value) or default_colors
         self.protocol = FixedColorProtocol(colors_path=colors_path)
+        self.low_segments = [
+            int(v) for v in self.declare_parameter('low_segments', [0, 1, 2]).value]
+        self.high_segments = [
+            int(v) for v in self.declare_parameter('high_segments', [3, 4, 5]).value]
+        self.low_brightness = float(
+            self.declare_parameter('low_brightness', 6.0).value)
+        self.high_brightness = float(
+            self.declare_parameter('high_brightness', 60.0).value)
+        self.low_reverse_order = bool(
+            self.declare_parameter('low_reverse_order', False).value)
+        self.high_reverse_order = bool(
+            self.declare_parameter('high_reverse_order', False).value)
+        self.segment_starts = [
+            int(v) for v in self.declare_parameter(
+                'segment_starts', list(range(self.pixel_count))).value]
+        self.segment_stops = [
+            int(v) for v in self.declare_parameter(
+                'segment_stops', list(range(1, self.pixel_count + 1))).value]
+        self.brightness_mode = str(self.declare_parameter(
+            'brightness_mode', 'segment_bri').value)
+        self.wled_master_brightness = float(
+            self.declare_parameter('wled_master_brightness', 255.0).value)
+        self.display_segments = build_triplet_segment_specs(
+            self.protocol.code_length,
+            self.low_segments,
+            self.low_brightness,
+            self.low_reverse_order,
+            self.high_segments,
+            self.high_brightness,
+            self.high_reverse_order,
+            self.segment_starts,
+            self.segment_stops,
+        )
         self.pending_id: Optional[int] = None
         self.active_command: Optional[int] = None
 
@@ -141,7 +165,9 @@ class RgbLedSender(Node):
         self.create_timer(max(retry_period, 0.05), self._dispatch)
         self.get_logger().info(
             f'RGB LED sender ready: topic={topic}, transport={self.transport}, '
-            f'groups={self.groups}, pixel_count={self.pixel_count}')
+            f'low_segments={self.low_segments}, high_segments={self.high_segments}, '
+            f'low_reverse={self.low_reverse_order}, '
+            f'high_reverse={self.high_reverse_order}, pixel_count={self.pixel_count}')
 
     def _init_serial_transport(self) -> None:
         self.serial_device_config = str(
@@ -182,7 +208,13 @@ class RgbLedSender(Node):
         if code is None or rgb is None:
             self.pending_id = None
             return
-        payload = build_wled_state_json(rgb, self.brightness, self.pixel_count)
+        payload = build_wled_state_json(
+            rgb,
+            self.display_segments,
+            self.pixel_count,
+            self.brightness_mode,
+            self.wled_master_brightness,
+        )
         try:
             response = self.serial.write_line(f'{payload}\n')
         except OSError as exc:
