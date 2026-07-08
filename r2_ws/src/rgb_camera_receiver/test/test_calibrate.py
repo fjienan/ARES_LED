@@ -58,7 +58,18 @@ def test_failed_self_check_does_not_overwrite_active_config(
         detected_shapes.append(image.shape[:2])
         return []
 
-    monkeypatch.setattr(calibration, 'detect_candidates', reject_candidates)
+    base_classifier = calibration.classifier_for_profile('usb_rgb_1')
+
+    class RejectingClassifier:
+        ColorModel = base_classifier.ColorModel
+        load_config = staticmethod(base_classifier.load_config)
+        select_winner = staticmethod(base_classifier.select_winner)
+        detect_candidates = staticmethod(reject_candidates)
+
+    monkeypatch.setattr(
+        calibration,
+        'classifier_for_profile',
+        lambda _profile: RejectingClassifier)
 
     with pytest.raises(RuntimeError, match='active detector config was not changed'):
         calibration.calibrate(dataset, base_config, output)

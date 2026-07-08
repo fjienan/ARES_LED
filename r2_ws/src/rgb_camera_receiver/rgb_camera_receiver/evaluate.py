@@ -8,13 +8,7 @@ from typing import Dict, List, Sequence
 
 import cv2
 
-from .classifier import (
-    annotate,
-    detect_proposals,
-    detection_metrics,
-    load_config,
-    select_winner,
-)
+from .classifier import classifier_for_profile
 from .profiles import (
     CAMERA_PROFILES,
     DEFAULT_CAMERA_PROFILE,
@@ -25,7 +19,18 @@ from .profiles import (
 )
 
 
-CLASSES = ('BLUE', 'CYAN', 'GREEN', 'PURPLE', 'RED', 'NONE')
+DEFAULT_CLASS_ORDER = ('BLUE', 'CYAN', 'GREEN', 'PURPLE', 'RED')
+
+
+def _evaluation_classes(config, dataset: Path):
+    """按 detector 当前启用颜色和 NONE 负样本目录确定验收类别。"""
+    configured = {item.name for item in config.colors}
+    ordered = [name for name in DEFAULT_CLASS_ORDER if name in configured]
+    ordered.extend(
+        sorted(name for name in configured if name not in set(ordered)))
+    if (dataset / 'NONE').is_dir():
+        ordered.append('NONE')
+    return tuple(ordered)
 
 
 def _different_color_margin(candidates) -> float:
@@ -52,13 +57,13 @@ def _evaluation_passed(
     )
 
 
-def _detect_with_scale(image, config, processing_scale: float):
+def _detect_with_scale(image, config, processing_scale: float, classifier):
     work = image
     if processing_scale < 1.0:
         work = cv2.resize(
             image, None, fx=processing_scale, fy=processing_scale,
             interpolation=cv2.INTER_AREA)
-    proposals = detect_proposals(work, config)
+    proposals = classifier.detect_proposals(work, config)
     if processing_scale < 1.0:
         inverse = 1.0 / processing_scale
         proposals = [item.scaled(inverse) for item in proposals]
@@ -69,26 +74,30 @@ def evaluate(
         dataset: Path,
         output: Path,
         config_path: Path,
-        processing_scale: float = 1.0) -> int:
-    config = load_config(str(config_path))
+        processing_scale: float = 1.0,
+        camera_profile: str = DEFAULT_CAMERA_PROFILE) -> int:
+    classifier = classifier_for_profile(camera_profile)
+    config = classifier.load_config(str(config_path))
     processing_scale = max(0.1, min(float(processing_scale), 1.0))
+    classes = _evaluation_classes(config, dataset)
     records: List[Dict] = []
     durations = []
     class_counts = {name: len(list((dataset / name).glob('*.jpg')))
-                    for name in CLASSES}
-    for expected in CLASSES:
+                    for name in classes}
+    for expected in classes:
         for image_path in sorted((dataset / expected).glob('*.jpg')):
             image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image is None:
                 raise RuntimeError(f'cannot read {image_path}')
             started = time.perf_counter()
-            proposals = _detect_with_scale(image, config, processing_scale)
+            proposals = _detect_with_scale(
+                image, config, processing_scale, classifier)
             duration = time.perf_counter() - started
             durations.append(duration)
             candidates = [
                 item for item in proposals if item.score >= config.min_score
             ]
-            winner = select_winner(candidates, config)
+            winner = classifier.select_winner(candidates, config)
             records.append({
                 'path': image_path,
                 'expected': expected,
@@ -149,13 +158,13 @@ def evaluate(
         target_dir = output / expected
         target_dir.mkdir(parents=True, exist_ok=True)
         image = cv2.imread(str(record['path']), cv2.IMREAD_COLOR)
-        rendered = annotate(image, record['proposals'], winner)
+        rendered = classifier.annotate(image, record['proposals'], winner)
         cv2.imwrite(str(target_dir / record['path'].name), rendered)
         proposal_data = []
         for index, item in enumerate(record['proposals'], 1):
             metrics = {
                 name: round(value, 6)
-                for name, value in detection_metrics(item).items()
+                for name, value in classifier.detection_metrics(item).items()
             }
             proposal_data.append({
                 'rank': index,
@@ -255,7 +264,8 @@ def evaluate_scales(
         dataset: Path,
         output: Path,
         config_path: Path,
-        processing_scales: Sequence[float]) -> int:
+        processing_scales: Sequence[float],
+        camera_profile: str = DEFAULT_CAMERA_PROFILE) -> int:
     scales = []
     for scale in processing_scales:
         normalized = max(0.1, min(float(scale), 1.0))
@@ -263,7 +273,13 @@ def evaluate_scales(
             scales.append(normalized)
     multiple = len(scales) > 1
     results = [
-        evaluate(dataset, _scale_output(output, scale, multiple), config_path, scale)
+        evaluate(
+            dataset,
+            _scale_output(output, scale, multiple),
+            config_path,
+            scale,
+            camera_profile,
+        )
         for scale in scales
     ]
     return 0 if any(code == 0 for code in results) else 1
@@ -298,7 +314,7 @@ def main() -> None:
     config = args.config or detector_config_path(args.camera_profile)
     if args.config is None:
         config = require_calibrated_detector(config, args.camera_profile)
-    loaded = load_config(str(config))
+    loaded = classifier_for_profile(args.camera_profile).load_config(str(config))
     if args.scan_processing_scales:
         scales = (1.0, 0.75, 0.67)
     else:
@@ -307,7 +323,8 @@ def main() -> None:
         dataset.resolve(),
         output.resolve(),
         config.resolve(),
-        scales))
+        scales,
+        args.camera_profile))
 
 
 if __name__ == '__main__':

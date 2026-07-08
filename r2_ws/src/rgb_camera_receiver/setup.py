@@ -28,7 +28,7 @@ setup(
     zip_safe=True,
     maintainer='robocon',
     maintainer_email='robocon@example.com',
-    description='Protocol-independent five-color LED strip detector for R2.',
+    description='Protocol-independent LED strip detector for R2.',
     license='MIT',
     entry_points={
         'console_scripts': [

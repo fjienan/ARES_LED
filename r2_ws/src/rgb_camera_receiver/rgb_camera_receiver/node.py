@@ -14,7 +14,7 @@ from std_msgs.msg import Int32
 
 from rgb_comm_protocol import FixedColorProtocol
 
-from .classifier import annotate, detect_candidates, load_config, select_winner
+from .classifier import classifier_for_profile
 from .protocol_decoder import (
     annotate_protocol,
     decode_protocol_candidates,
@@ -36,6 +36,7 @@ class LedStripReceiver(Node):
         super().__init__('rgb_camera_receiver')
         profile = validate_camera_profile(str(self.declare_parameter(
             'camera_profile', DEFAULT_CAMERA_PROFILE).value))
+        self.classifier = classifier_for_profile(profile)
         requested = str(self.declare_parameter('camera_device', 'auto').value)
         width = int(self.declare_parameter('frame_width', 1280).value)
         height = int(self.declare_parameter('frame_height', 720).value)
@@ -69,7 +70,7 @@ class LedStripReceiver(Node):
         config_path = str(require_calibrated_detector(
             Path(configured_detector or default_detector).expanduser(),
             profile))
-        self.config = load_config(config_path)
+        self.config = self.classifier.load_config(config_path)
         protocol_config = str(self.declare_parameter(
             'protocol_config', '').value)
         self.protocol = FixedColorProtocol(
@@ -111,11 +112,11 @@ class LedStripReceiver(Node):
         scale = self.processing_scale
         if scale < 1.0:
             work = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        candidates = detect_candidates(work, self.config)
+        candidates = self.classifier.detect_candidates(work, self.config)
         if scale < 1.0:
             inverse = 1.0 / scale
             candidates = [item.scaled(inverse) for item in candidates]
-        single_winner = select_winner(candidates, self.config)
+        single_winner = self.classifier.select_winner(candidates, self.config)
         protocol_candidates = decode_protocol_candidates(
             candidates, self.protocol, self.pairing_config)
         protocol_winner = select_protocol_winner(
@@ -152,7 +153,7 @@ class LedStripReceiver(Node):
                     f'state={"LOCK" if self.locked else "WAIT"}')
             self.last_label = label
         if self.preview:
-            rendered = annotate(frame, candidates, single_winner)
+            rendered = self.classifier.annotate(frame, candidates, single_winner)
             rendered = annotate_protocol(
                 rendered,
                 protocol_candidates,

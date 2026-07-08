@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""USB RGB 摄像头采集：实时预览，并按固定间隔保存 JPG 原图。"""
+"""USB RGB 摄像头采集：自动选择外接摄像头，实时预览，并按固定间隔保存 JPG 原图。"""
 
 import argparse
 from datetime import datetime
 import glob
 import os
 from pathlib import Path
+import subprocess
 import time
 
 import cv2
@@ -14,8 +15,11 @@ import cv2
 INTEGRATED_CAMERA_KEYWORDS = (
     'integrated',
     'internal camera',
+    'internal',
     'built-in',
     'builtin',
+    'facetime',
+    'laptop',
 )
 
 
@@ -33,6 +37,46 @@ def is_integrated_camera(device: str) -> bool:
     return any(keyword in name for keyword in INTEGRATED_CAMERA_KEYWORDS)
 
 
+def is_video_capture_device(device: str) -> bool:
+    try:
+        result = subprocess.run(
+            ['v4l2-ctl', '--device', device, '--all'],
+            check=False, capture_output=True, text=True, timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+
+    if result.returncode != 0:
+        return True
+
+    capability_lines = []
+    in_device_caps = False
+    for line in result.stdout.splitlines():
+        if 'Device Caps' in line:
+            in_device_caps = True
+            capability_lines = []
+            continue
+        if in_device_caps:
+            if line[:1].isspace():
+                stripped = line.strip()
+                if stripped:
+                    capability_lines.append(stripped)
+            elif capability_lines:
+                break
+
+    capabilities = capability_lines or result.stdout.splitlines()
+    has_video = any(
+        item in ('Video Capture', 'Video Capture Multiplanar')
+        for item in capabilities)
+    has_metadata = any(item == 'Metadata Capture' for item in capabilities)
+    return has_video and not has_metadata
+
+
+def device_label(device: str) -> str:
+    name = camera_name(device) or 'unknown'
+    real = os.path.realpath(device)
+    return f'{device} -> {real} ({name})'
+
+
 def camera_candidates(device: str):
     if device.lower() != 'auto':
         if is_integrated_camera(device):
@@ -40,14 +84,17 @@ def camera_candidates(device: str):
                 f'refusing integrated camera {device} ({camera_name(device)})')
         return [device]
 
+    # 优先使用 by-id 中的 index0。这样能避开同一摄像头暴露出的元数据节点，
+    # 也比 /dev/videoN 更稳定。
     paths = sorted(glob.glob('/dev/v4l/by-id/*-video-index0'))
-    paths += sorted(glob.glob('/dev/v4l/by-id/*'))
     paths += sorted(glob.glob('/dev/video*'))
     result = []
     real_devices = set()
     for path in paths:
         real = os.path.realpath(path)
         if is_integrated_camera(path):
+            continue
+        if not is_video_capture_device(path):
             continue
         if path in result or real in real_devices:
             continue
@@ -57,8 +104,10 @@ def camera_candidates(device: str):
 
 
 def open_camera(device: str, width: int, height: int, fps: float):
+    candidates = camera_candidates(device)
     failed = []
-    for candidate in camera_candidates(device):
+    opened = []
+    for candidate in candidates:
         source = int(candidate) if candidate.isdigit() else candidate
         capture = cv2.VideoCapture(source, cv2.CAP_V4L2)
         if not capture.isOpened():
@@ -73,9 +122,23 @@ def open_camera(device: str, width: int, height: int, fps: float):
         capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         ok, frame = capture.read()
         if ok and frame is not None:
-            return capture, candidate
+            if device.lower() != 'auto':
+                return capture, candidate
+            opened.append((candidate, capture))
+            continue
         capture.release()
         failed.append(candidate)
+
+    if device.lower() == 'auto':
+        if len(opened) == 1:
+            return opened[0][1], opened[0][0]
+        if len(opened) > 1:
+            for _, capture in opened:
+                capture.release()
+            lines = '\n  '.join(device_label(candidate) for candidate, _ in opened)
+            raise RuntimeError(
+                'found more than one readable non-integrated USB camera; '
+                'keep only one connected or pass --device explicitly:\n  ' + lines)
 
     raise RuntimeError(
         f'cannot open USB RGB camera {device}; '
@@ -86,15 +149,19 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Preview the USB RGB camera and save raw JPG images.')
     parser.add_argument(
+        '--camera', '--camera-id', dest='camera_id', type=int, choices=(1, 2),
+        default=1,
+        help='camera dataset number: 1 saves to usb_rgb_1, 2 saves to usb_rgb_2; default: 1')
+    parser.add_argument(
         '--device', default='auto',
-        help='auto, /dev/video0, or a /dev/v4l/by-id path')
+        help='auto, /dev/video0, or a /dev/v4l/by-id path; default: auto')
     parser.add_argument(
         '--output',
         help='directory in which JPG images are saved; '
-             'default: <repo>/camera_data/usb_rgb_1/raw')
+             'default: <repo>/camera_data/usb_rgb_<camera>/raw')
     parser.add_argument(
-        '--prefix', default='usb_rgb_1',
-        help='saved file prefix, e.g. usb_rgb_1 or usb_rgb_2')
+        '--prefix',
+        help='saved file prefix; default: usb_rgb_<camera>')
     parser.add_argument(
         '--interval', type=float, default=2.0,
         help='save interval in seconds, default: 2')
@@ -115,10 +182,12 @@ def main():
     if not 1 <= args.jpeg_quality <= 100:
         raise SystemExit('--jpeg-quality must be in 1..100')
 
+    camera_key = f'usb_rgb_{args.camera_id}'
     default_output = (
         Path(__file__).resolve().parents[1] /
-        'camera_data' / 'usb_rgb_1' / 'raw')
+        'camera_data' / camera_key / 'raw')
     output_dir = Path(args.output).expanduser().resolve() if args.output else default_output
+    prefix = args.prefix if args.prefix else camera_key
     output_dir.mkdir(parents=True, exist_ok=True)
     capture, selected_device = open_camera(
         args.device, args.width, args.height, args.fps)
@@ -126,7 +195,8 @@ def main():
     actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = capture.get(cv2.CAP_PROP_FPS)
-    print(f'camera: {selected_device} ({camera_name(selected_device)})')
+    print(f'camera id: {args.camera_id}')
+    print(f'device: {selected_device} ({camera_name(selected_device)})')
     print(f'format: {actual_width}x{actual_height} @ {actual_fps:.1f} Hz')
     print(f'output: {output_dir}')
     print(f'saving every {args.interval:g} seconds; press q/Esc/Ctrl+C to stop')
@@ -147,7 +217,7 @@ def main():
             now = time.monotonic()
             if now >= next_save:
                 stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-                path = output_dir / f'{args.prefix}_{stamp}_{count:06d}.jpg'
+                path = output_dir / f'{prefix}_{stamp}_{count:06d}.jpg'
                 saved = cv2.imwrite(
                     str(path), frame,
                     [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])

@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import yaml
 
-from .classifier import ColorModel, detect_candidates, load_config, select_winner
+from .classifier import classifier_for_profile
 from .profiles import (
     CAMERA_PROFILES,
     DEFAULT_CAMERA_PROFILE,
@@ -21,7 +21,24 @@ from .profiles import (
 )
 
 
-CLASSES = ('RED', 'GREEN', 'CYAN', 'BLUE', 'PURPLE')
+DEFAULT_CLASS_ORDER = ('RED', 'GREEN', 'CYAN', 'BLUE', 'PURPLE')
+# 兼容旧测试和外部脚本；实际校准会按当前 profile 配置动态筛选。
+CLASSES = DEFAULT_CLASS_ORDER
+
+
+def _calibration_classes(dataset: Path, base_config: Dict) -> Tuple[str, ...]:
+    """只校准当前 detector 启用、且数据集中存在样本的颜色。"""
+    configured = set((base_config.get('colors') or {}).keys())
+    classes = [
+        name for name in DEFAULT_CLASS_ORDER
+        if name in configured and any((dataset / name).glob('*.jpg'))
+    ]
+    classes.extend(sorted(
+        name for name in configured
+        if name not in set(classes) and any((dataset / name).glob('*.jpg'))))
+    if not classes:
+        raise RuntimeError(f'no calibration color images found in {dataset}')
+    return tuple(classes)
 
 
 def _save_validated_config(
@@ -118,12 +135,18 @@ def _prepare_detection_image(
         image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
 
-def calibrate(dataset: Path, base_config: Path, output: Path) -> None:
+def calibrate(
+        dataset: Path,
+        base_config: Path,
+        output: Path,
+        camera_profile: str = DEFAULT_CAMERA_PROFILE) -> None:
+    classifier = classifier_for_profile(camera_profile)
     with base_config.open('r', encoding='utf-8') as stream:
         config = yaml.safe_load(stream)
+    classes = _calibration_classes(dataset, config)
     calibrated = {}
     summaries = {}
-    for name in CLASSES:
+    for name in classes:
         hue_rows = []
         saturation_rows = []
         bgr_rows = []
@@ -198,26 +221,26 @@ def calibrate(dataset: Path, base_config: Path, output: Path) -> None:
                 for key, channel in ratios.items()
             },
         }
-    base = load_config(str(base_config))
+    base = classifier.load_config(str(base_config))
     proposed = replace(base, colors=tuple(
-        ColorModel(name=name, **{
+        classifier.ColorModel(name=name, **{
             key: float(value) for key, value in calibrated[name].items()
             if key not in {'name', 'channel_min', 'channel_max'}
         }, **{
             key: value for key, value in calibrated[name].items()
             if key in {'channel_min', 'channel_max'}
-        }) for name in CLASSES))
+        }) for name in classes))
     valid = True
     rejected_by = None
-    for expected in (*CLASSES, 'NONE'):
+    for expected in (*classes, 'NONE'):
         for path in sorted((dataset / expected).glob('*.jpg')):
             image = cv2.imread(str(path), cv2.IMREAD_COLOR)
             if image is None:
                 raise RuntimeError(f'cannot read {path}')
             work = _prepare_detection_image(
                 image, proposed.processing_scale)
-            candidates = detect_candidates(work, proposed)
-            winner = select_winner(candidates, proposed)
+            candidates = classifier.detect_candidates(work, proposed)
+            winner = classifier.select_winner(candidates, proposed)
             if expected == 'NONE':
                 valid = not candidates
             else:
@@ -239,7 +262,7 @@ def calibrate(dataset: Path, base_config: Path, output: Path) -> None:
             f'proposed model failed self-check at {rejected_by}; '
             f'active detector config was not changed')
     _save_validated_config(config, calibrated, output)
-    for name in CLASSES:
+    for name in classes:
         summary = summaries[name]
         print(
             f'{name}: images={summary["images"]} pixels={summary["pixels"]} '
@@ -272,7 +295,11 @@ def main() -> None:
     config = args.base_config or detector_config_path(args.camera_profile)
     output = args.output or config
     dataset = args.dataset or dataset_path(args.camera_profile)
-    calibrate(dataset.resolve(), config.resolve(), output.resolve())
+    calibrate(
+        dataset.resolve(),
+        config.resolve(),
+        output.resolve(),
+        args.camera_profile)
 
 
 if __name__ == '__main__':

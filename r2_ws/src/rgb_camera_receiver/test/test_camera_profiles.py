@@ -28,9 +28,9 @@ def test_detector_configs_are_profile_scoped():
         assert (root / 'detector.yaml').is_file()
 
 
-def test_only_first_usb_rgb_is_calibrated_now():
+def test_usb_rgb_profiles_are_calibrated():
     assert load_yaml(CONFIG / 'cameras' / 'usb_rgb_1' / 'detector.yaml')['calibrated']
-    assert not load_yaml(CONFIG / 'cameras' / 'usb_rgb_2' / 'detector.yaml')['calibrated']
+    assert load_yaml(CONFIG / 'cameras' / 'usb_rgb_2' / 'detector.yaml')['calibrated']
 
 
 def test_profile_validation_rejects_unknown_camera():

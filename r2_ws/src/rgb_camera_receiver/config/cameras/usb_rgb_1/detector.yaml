@@ -1,6 +1,8 @@
 calibrated: true
 processing:
   scale: 0.4
+color_assignment:
+  exclusive_hue_owner: true
 colors:
   RED:
     hue_center: 2.46
