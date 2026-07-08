@@ -11,14 +11,14 @@ camera_slots:
   camera_1:
     enabled: true
     profile: usb_rgb_1
-    device: /dev/v4l/by-id/usb-CHANGE_ME_camera_1-video-index0
+    device: /dev/v4l/by-path/pci-0000:05:00.4-usb-0:2:1.0-video-index0
     required: false
     show_preview: true
 
   camera_2:
     enabled: true
     profile: usb_rgb_2
-    device: /dev/v4l/by-id/usb-CHANGE_ME_camera_2-video-index0
+    device: /dev/v4l/by-path/pci-0000:05:00.3-usb-0:2:1.0-video-index0
     required: false
     show_preview: true
 

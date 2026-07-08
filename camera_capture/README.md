@@ -85,8 +85,8 @@ cd <仓库根目录>/camera_capture
 默认保存目录：
 
 ```text
-<仓库根目录>/camera_capture_positive_usb_rgb_1
-<仓库根目录>/camera_capture_positive_usb_rgb_2
+<仓库根目录>/camera_capture_results/positive_usb_rgb_1
+<仓库根目录>/camera_capture_results/positive_usb_rgb_2
 ```
 
 连续阳性时默认最多每 1 秒保存一张。需要改间隔：
@@ -116,7 +116,7 @@ cd <仓库根目录>/camera_capture
 默认保存目录：
 
 ```text
-<仓库根目录>/camera_capture_positive_usb_rgb_1_combined
+<仓库根目录>/camera_capture_results/positive_usb_rgb_1_combined
 ```
 
 摄像头 2：
@@ -129,7 +129,7 @@ cd <仓库根目录>/camera_capture
 默认保存目录：
 
 ```text
-<仓库根目录>/camera_capture_positive_usb_rgb_2_combined
+<仓库根目录>/camera_capture_results/positive_usb_rgb_2_combined
 ```
 
 连续识别到同一三段编码时默认最多每 1 秒保存一张；如果三段编码变化，会立即保存：

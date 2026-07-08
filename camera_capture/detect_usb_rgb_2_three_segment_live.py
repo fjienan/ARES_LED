@@ -46,8 +46,9 @@ def parse_args():
         help='显示窗口缩放比例；默认 0.6')
     parser.add_argument(
         '--output',
-        default=str(REPO_ROOT / 'camera_capture_positive_usb_rgb_2_combined'),
-        help='阳性原图保存目录；默认 camera_capture_positive_usb_rgb_2_combined')
+        default=str(
+            REPO_ROOT / 'camera_capture_results' / 'positive_usb_rgb_2_combined'),
+        help='阳性原图保存目录；默认 camera_capture_results/positive_usb_rgb_2_combined')
     parser.add_argument(
         '--interval', type=float, default=1.0,
         help='连续识别到同一编码时的最小保存间隔秒数；默认 1.0')

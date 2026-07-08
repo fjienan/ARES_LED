@@ -74,8 +74,9 @@ def parse_args():
         help='输入图片目录；默认 camera_data/usb_rgb_2/combined')
     parser.add_argument(
         '--output',
-        default=str(REPO_ROOT / 'camera_results' / 'usb_rgb_2' / 'combined'),
-        help='标注图片输出目录；默认 camera_results/usb_rgb_2/combined')
+        default=str(
+            REPO_ROOT / 'camera_capture_results' / 'usb_rgb_2' / 'combined'),
+        help='标注图片输出目录；默认 camera_capture_results/usb_rgb_2/combined')
     parser.add_argument(
         '--config',
         default=str(

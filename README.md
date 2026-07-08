@@ -77,6 +77,21 @@ source install/setup.bash
 ros2 launch rgb_led_sender r1_rgb_comm.launch.py
 ```
 
+部署到 R1 远端主机时，当前路径为 `librgod@100.123.45.4:~/ARES_LED`：
+
+```bash
+ssh librgod@100.123.45.4
+cd ~/ARES_LED/r1_ws
+unset CONDA_PREFIX CONDA_DEFAULT_ENV PYTHONPATH
+source /opt/ros/humble/setup.bash
+export PATH=/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+colcon build --base-paths src ../shared/src \
+  --packages-select rgb_comm_protocol rgb_led_sender \
+  --cmake-args -DPYTHON_EXECUTABLE=/usr/bin/python3 -DPython3_EXECUTABLE=/usr/bin/python3
+source install/setup.bash
+ros2 launch rgb_led_sender r1_rgb_comm.launch.py
+```
+
 启动前确认 WLED 控制器 USB 已连接并枚举为 CDC 串口：
 
 ```bash
@@ -170,7 +185,7 @@ ros2 launch rgb_camera_receiver r2_dual_led_vision.launch.py
 ```
 
 双摄像头配置在 `r2_ws/src/rgb_camera_receiver/config/dual_receiver.yaml`。
-不要在双摄像头配置中使用 `auto`；先查清楚稳定设备路径：
+不要在双摄像头配置中使用 `auto`；先查清楚摄像头枚举结果和稳定设备路径：
 
 ```bash
 v4l2-ctl --list-devices
@@ -178,21 +193,42 @@ ls -l /dev/v4l/by-id/
 ls -l /dev/v4l/by-path/
 ```
 
-然后把对应路径填入：
+再逐个测试哪个 `/dev/videoX` 真能出图。无预览测试：
+
+```bash
+/usr/bin/python3 ~/Desktop/LED/camera_capture/capture_usb_rgb.py \
+  --camera 1 \
+  --device /dev/video4 \
+  --no-preview
+```
+
+实时预览测试：
+
+```bash
+/usr/bin/python3 ~/Desktop/LED/camera_capture/capture_usb_rgb.py \
+  --camera 1 \
+  --device /dev/video4
+```
+
+`/dev/video4` 只用于临时验证，最终配置不要写这种可能变化的名字。确认哪一路能出图后，
+把对应的稳定路径填入 `dual_receiver.yaml`，优先使用 `/dev/v4l/by-id/...video-index0`；
+如果两台摄像头型号相同或 by-id 不够区分，使用和 USB 口绑定的 `/dev/v4l/by-path/...`：
 
 ```yaml
 camera_slots:
   camera_1:
+    enabled: true
     profile: usb_rgb_1
-    device: /dev/v4l/by-path/CHANGE_ME_CAMERA_1
+    device: /dev/v4l/by-id/usb-xxx-camera-A-video-index0
     required: false
+
   camera_2:
+    enabled: true
     profile: usb_rgb_2
-    device: /dev/v4l/by-path/CHANGE_ME_CAMERA_2
+    device: /dev/v4l/by-id/usb-yyy-camera-B-video-index0
     required: false
 ```
 
-如果两台摄像头型号相同，优先使用 `/dev/v4l/by-path/`，它和 USB 口绑定，更容易区分。
 `required: false` 表示只连接一台摄像头也允许启动测试。
 
 如需单独调试某一个 profile：

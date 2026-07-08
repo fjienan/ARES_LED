@@ -44,7 +44,7 @@ def parse_args():
         help='显示窗口缩放比例；默认 0.6')
     parser.add_argument(
         '--output',
-        help='阳性原图保存目录；默认 <仓库>/camera_capture_positive_usb_rgb_<camera>')
+        help='阳性原图保存目录；默认 <仓库>/camera_capture_results/positive_usb_rgb_<camera>')
     parser.add_argument(
         '--interval', type=float, default=1.0,
         help='连续阳性时的最小保存间隔秒数；默认 1.0')
@@ -139,7 +139,7 @@ def main():
     output_dir = (
         Path(args.output).expanduser().resolve()
         if args.output
-        else REPO_ROOT / f'camera_capture_positive_{profile}'
+        else REPO_ROOT / 'camera_capture_results' / f'positive_{profile}'
     )
     if not args.no_save:
         output_dir.mkdir(parents=True, exist_ok=True)
