@@ -23,6 +23,7 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        ('share/' + package_name + '/config', glob('config/*.yaml')),
     ] + camera_config_files(),
     install_requires=['setuptools'],
     zip_safe=True,
@@ -33,6 +34,7 @@ setup(
     entry_points={
         'console_scripts': [
             'rgb_camera_receiver = rgb_camera_receiver.node:main',
+            'rgb_command_arbiter = rgb_camera_receiver.command_arbiter:main',
             'evaluate_led_dataset = rgb_camera_receiver.evaluate:main',
             'calibrate_led_colors = rgb_camera_receiver.calibrate:main',
         ],

@@ -7,7 +7,7 @@ Color = Tuple[int, int, int]
 
 
 class FixedColorProtocol:
-    """整数命令与颜色符号对之间的双向映射。"""
+    """整数命令与固定长度颜色符号序列之间的双向映射。"""
 
     def __init__(
             self,
@@ -37,12 +37,19 @@ class FixedColorProtocol:
             int(command): self._normalize_code(code)
             for command, code in data['commands'].items()
         }
-        if any(len(code) != 2 for code in self.commands.values()):
-            raise ValueError('every protocol code must contain exactly two symbols')
-        if any(code[0] == code[1] for code in self.commands.values()):
-            raise ValueError('the two symbols in each protocol code must differ')
+        if not self.commands:
+            raise ValueError('protocol config must define at least one command')
+        lengths = {len(code) for code in self.commands.values()}
+        if len(lengths) != 1:
+            raise ValueError('every protocol code must contain the same number of symbols')
+        self.code_length = next(iter(lengths))
+        if self.code_length <= 0:
+            raise ValueError('protocol codes must not be empty')
+        if any(len(set(code)) != len(code) for code in self.commands.values()):
+            raise ValueError('symbols in each protocol code must be unique')
         if len(set(self.commands.values())) != len(self.commands):
             raise ValueError('protocol codes must be unique')
+        self.decode_reversed = bool(data.get('decode_reversed', False))
         if self.colors:
             unknown = {
                 symbol
@@ -54,7 +61,10 @@ class FixedColorProtocol:
                 raise ValueError(f'unknown color symbols: {sorted(unknown)}')
         self._decode: Dict[Tuple[str, ...], int] = {}
         for command, code in self.commands.items():
-            for accepted in {code, tuple(reversed(code))}:
+            accepted_codes = {code}
+            if self.decode_reversed:
+                accepted_codes.add(tuple(reversed(code)))
+            for accepted in accepted_codes:
                 owner = self._decode.get(accepted)
                 if owner is not None and owner != command:
                     raise ValueError(

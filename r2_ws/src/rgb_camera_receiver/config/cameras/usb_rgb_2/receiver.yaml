@@ -7,6 +7,8 @@ rgb_camera_receiver:
 
     # auto 会跳过笔记本内置摄像头，并选择首个可读取的外部视频流。
     camera_device: auto
+    camera_required: true
+    camera_retry_period_sec: 1.0
     camera_reject_keywords: Integrated,Chicony
     frame_width: 1280
     frame_height: 720
@@ -27,11 +29,15 @@ rgb_camera_receiver:
     positive_capture_dir: ~/Desktop/LED/camera_capture_positive_usb_rgb_2
     positive_save_interval_sec: 1.0
 
-    # 发布前通过多帧确认解码出的两段协议命令。在 30 Hz 下，7 帧取 5 帧
-    # 既能快速响应，也能排除大部分单帧错误。
+    # 发布前通过多次“已处理帧”确认解码出的三段协议命令。
+    # 摄像头可以是 30 Hz；检测忙时会丢弃旧帧，只处理最新帧，避免延迟堆积。
     protocol_config: ""
     output_topic: /aruco_comm/rx_id
-    confirmation_window: 7
-    confirmation_required: 5
+    reset_command_id: 0
+    # 单 receiver 直接输出时不发布 0；双摄像头 launch 会覆盖为 true，
+    # 让 arbiter 接收 0 后执行内部解锁。
+    publish_reset_commands: false
+    confirmation_window: 4
+    confirmation_required: 3
+    max_confirm_latency_sec: 0.20
     protocol_winner_margin: 1.20
-    off_unlock_sec: 0.35

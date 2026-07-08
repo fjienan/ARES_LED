@@ -65,7 +65,7 @@ v4l2-ctl --list-devices
 
 ## 实时单色检测并保存阳性图片
 
-该脚本不启动 ROS，也不依赖两段通信协议，只使用当前对应摄像头 profile 的
+该脚本不启动 ROS，也不依赖通信协议，只使用当前对应摄像头 profile 的
 `detector.yaml` 和 classifier。
 
 摄像头 1：

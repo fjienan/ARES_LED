@@ -1,0 +1,27 @@
+# 双 USB 摄像头接收配置。
+#
+# 不要在这里使用 auto。先用下面命令查稳定设备名：
+#   v4l2-ctl --list-devices
+#   ls -l /dev/v4l/by-id/
+#   ls -l /dev/v4l/by-path/
+#
+# 如果两台摄像头型号/序列号相同，/dev/v4l/by-id/ 可能不够区分，
+# 优先使用 /dev/v4l/by-path/ 中和 USB 口绑定的路径。
+camera_slots:
+  camera_1:
+    enabled: true
+    profile: usb_rgb_1
+    device: /dev/v4l/by-id/usb-CHANGE_ME_camera_1-video-index0
+    required: false
+    show_preview: true
+
+  camera_2:
+    enabled: true
+    profile: usb_rgb_2
+    device: /dev/v4l/by-id/usb-CHANGE_ME_camera_2-video-index0
+    required: false
+    show_preview: true
+
+arbiter:
+  output_topic: /aruco_comm/rx_id
+  reset_command_id: 0

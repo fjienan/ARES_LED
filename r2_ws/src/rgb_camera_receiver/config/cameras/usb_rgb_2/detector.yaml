@@ -71,3 +71,15 @@ pairing:
   min_length_ratio: 0.35
   max_length_ratio: 2.8
   max_pairs: 20
+
+protocol_geometry:
+  # 三段协议组合约束。R2 只认正向协议，不在这里做正反等价。
+  min_command_score: 0.05
+  max_angle_degrees: 30.0
+  max_cross_distance_pixels: 65.0
+  min_center_distance_ratio: 0.25
+  max_center_distance_ratio: 4.5
+  min_length_ratio: 0.35
+  max_length_ratio: 3.0
+  max_gap_ratio: 5.0
+  max_candidates: 8

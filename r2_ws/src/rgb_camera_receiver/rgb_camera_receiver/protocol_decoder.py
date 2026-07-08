@@ -1,7 +1,8 @@
 import math
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -13,37 +14,83 @@ from .classifier import StripDetection
 
 
 @dataclass(frozen=True)
-class PairingConfig:
-    min_pair_score: float = 0.04
+class ProtocolGeometryConfig:
+    min_command_score: float = 0.04
     max_angle_degrees: float = 18.0
     max_cross_distance_pixels: float = 35.0
     min_center_distance_ratio: float = 0.35
     max_center_distance_ratio: float = 3.0
     min_length_ratio: float = 0.35
     max_length_ratio: float = 2.8
-    max_pairs: int = 20
+    max_gap_ratio: float = 4.0
+    max_candidates: int = 20
+
+
+# 保留旧名称，兼容已有测试和外部导入。
+PairingConfig = ProtocolGeometryConfig
 
 
 @dataclass(frozen=True)
 class ProtocolDetection:
     command_id: int
-    symbols: Tuple[str, str]
-    first: StripDetection
-    second: StripDetection
+    symbols: Tuple[str, ...]
+    segments: Tuple[StripDetection, ...]
     score: float
     confidence: float
     geometry_quality: float
     angle_degrees: float
     cross_distance: float
     center_distance_ratio: float
+    gap_ratio: float
+
+    @property
+    def first(self) -> StripDetection:
+        return self.segments[0]
+
+    @property
+    def second(self) -> StripDetection:
+        return self.segments[1]
 
 
-def load_pairing_config(path: str) -> PairingConfig:
+def load_pairing_config(path: str) -> ProtocolGeometryConfig:
     with Path(path).open('r', encoding='utf-8') as stream:
         raw = yaml.safe_load(stream) or {}
-    row = raw.get('pairing', {})
-    return PairingConfig(
-        min_pair_score=float(row.get('min_pair_score', 0.04)),
+
+    row = raw.get('protocol_geometry', {})
+    if not row:
+        three = raw.get('three_segment', {})
+        if three:
+            row = {
+                'min_command_score': three.get('min_three_score', 0.04),
+                'max_angle_degrees': three.get('max_angle_degrees', 18.0),
+                'max_cross_distance_pixels': three.get(
+                    'max_cross_distance', 35.0),
+                'min_center_distance_ratio': three.get(
+                    'min_center_distance_ratio', 0.35),
+                'max_center_distance_ratio': three.get(
+                    'max_center_distance_ratio', 3.0),
+                'max_gap_ratio': three.get('max_gap_ratio', 4.0),
+                'max_candidates': three.get('max_results', 20),
+            }
+        else:
+            pairing = raw.get('pairing', {})
+            row = {
+                'min_command_score': pairing.get(
+                    'min_pair_score', pairing.get('min_command_score', 0.04)),
+                'max_angle_degrees': pairing.get('max_angle_degrees', 18.0),
+                'max_cross_distance_pixels': pairing.get(
+                    'max_cross_distance_pixels', 35.0),
+                'min_center_distance_ratio': pairing.get(
+                    'min_center_distance_ratio', 0.35),
+                'max_center_distance_ratio': pairing.get(
+                    'max_center_distance_ratio', 3.0),
+                'min_length_ratio': pairing.get('min_length_ratio', 0.35),
+                'max_length_ratio': pairing.get('max_length_ratio', 2.8),
+                'max_candidates': pairing.get('max_pairs', 20),
+            }
+
+    return ProtocolGeometryConfig(
+        min_command_score=float(row.get('min_command_score', 0.04)),
         max_angle_degrees=float(row.get('max_angle_degrees', 18.0)),
         max_cross_distance_pixels=float(
             row.get('max_cross_distance_pixels', 35.0)),
@@ -53,11 +100,12 @@ def load_pairing_config(path: str) -> PairingConfig:
             row.get('max_center_distance_ratio', 3.0)),
         min_length_ratio=float(row.get('min_length_ratio', 0.35)),
         max_length_ratio=float(row.get('max_length_ratio', 2.8)),
-        max_pairs=int(row.get('max_pairs', 20)),
+        max_gap_ratio=float(row.get('max_gap_ratio', 4.0)),
+        max_candidates=int(row.get('max_candidates', 20)),
     )
 
 
-def _axis(candidate: StripDetection) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _axis(candidate: StripDetection) -> Tuple[np.ndarray, np.ndarray]:
     start = (candidate.corners[0] + candidate.corners[3]) * 0.5
     end = (candidate.corners[1] + candidate.corners[2]) * 0.5
     direction = end - start
@@ -67,108 +115,154 @@ def _axis(candidate: StripDetection) -> Tuple[np.ndarray, np.ndarray, np.ndarray
     else:
         direction = direction / norm
     center = (start + end) * 0.5
-    return center.astype(np.float32), direction.astype(np.float32), start.astype(np.float32)
+    return center.astype(np.float32), direction.astype(np.float32)
 
 
-def _ordered_pair(
-        first: StripDetection,
-        second: StripDetection) -> Tuple[StripDetection, StripDetection]:
-    center_a, axis_a, _ = _axis(first)
-    center_b, axis_b, _ = _axis(second)
-    axis = axis_a + axis_b
-    if float(np.linalg.norm(axis)) <= 1e-6:
-        axis = axis_a
-    if float(np.dot(center_b - center_a, axis)) < 0.0:
-        return second, first
-    return first, second
+def _aligned_average_axis(axes: Sequence[np.ndarray]) -> np.ndarray:
+    base = axes[0]
+    total = np.zeros(2, dtype=np.float32)
+    for axis in axes:
+        if float(np.dot(axis, base)) < 0.0:
+            axis = -axis
+        total += axis
+    norm = float(np.linalg.norm(total))
+    if norm <= 1e-6:
+        return base
+    return total / norm
 
 
-def _pair_geometry(
-        first: StripDetection,
-        second: StripDetection,
-        config: PairingConfig) -> Optional[Tuple[float, float, float, float]]:
-    center_a, axis_a, _ = _axis(first)
-    center_b, axis_b, _ = _axis(second)
-    dot = abs(float(np.dot(axis_a, axis_b)))
-    dot = max(-1.0, min(1.0, dot))
-    angle = math.degrees(math.acos(dot))
+def _angle_spread_degrees(axes: Sequence[np.ndarray]) -> float:
+    max_angle = 0.0
+    for left, right in combinations(axes, 2):
+        dot = abs(float(np.dot(left, right)))
+        dot = max(-1.0, min(1.0, dot))
+        max_angle = max(max_angle, math.degrees(math.acos(dot)))
+    return max_angle
+
+
+def _sequence_geometry(
+        raw_segments: Sequence[StripDetection],
+        config: ProtocolGeometryConfig
+) -> Optional[Tuple[Tuple[StripDetection, ...], float, float, float, float, float]]:
+    axis_rows = [_axis(item) for item in raw_segments]
+    centers = np.stack([item[0] for item in axis_rows], axis=0)
+    axes = [item[1] for item in axis_rows]
+    angle = _angle_spread_degrees(axes)
     if angle > config.max_angle_degrees:
         return None
 
-    average_axis = axis_a + axis_b
-    if float(np.linalg.norm(average_axis)) <= 1e-6:
-        average_axis = axis_a
-    average_axis = average_axis / max(float(np.linalg.norm(average_axis)), 1e-6)
-    normal = np.array((-average_axis[1], average_axis[0]), dtype=np.float32)
-    delta = center_b - center_a
-    center_distance = abs(float(np.dot(delta, average_axis)))
-    cross_distance = abs(float(np.dot(delta, normal)))
+    common_axis = _aligned_average_axis(axes)
+    origin = np.mean(centers, axis=0)
+    projections = (centers - origin) @ common_axis
+    order = np.argsort(projections)
+    ordered = tuple(raw_segments[index] for index in order)
+    ordered_centers = centers[order]
+    ordered_proj = projections[order]
+
+    normal = np.array((-common_axis[1], common_axis[0]), dtype=np.float32)
+    cross_distances = np.abs((ordered_centers - origin) @ normal)
+    cross_distance = float(np.max(cross_distances))
     if cross_distance > config.max_cross_distance_pixels:
         return None
 
-    median_length = max((first.length + second.length) * 0.5, 1.0)
-    center_distance_ratio = center_distance / median_length
-    if not (
-            config.min_center_distance_ratio <= center_distance_ratio <=
-            config.max_center_distance_ratio):
+    gaps = np.diff(ordered_proj)
+    if len(gaps) == 0 or np.any(gaps <= 1e-6):
         return None
-    length_ratio = first.length / max(second.length, 1e-6)
-    length_ratio = max(length_ratio, 1.0 / max(length_ratio, 1e-6))
+
+    lengths = np.array([item.length for item in ordered], dtype=np.float32)
+    median_length = max(float(np.median(lengths)), 1.0)
+    center_distance_ratios = gaps / median_length
+    if np.any(center_distance_ratios < config.min_center_distance_ratio):
+        return None
+    if np.any(center_distance_ratios > config.max_center_distance_ratio):
+        return None
+
+    center_distance_ratio = float(np.mean(center_distance_ratios))
+    gap_ratio = float(np.max(gaps) / max(float(np.min(gaps)), 1e-6))
+    if gap_ratio > config.max_gap_ratio:
+        return None
+
+    length_ratio = float(np.max(lengths) / max(float(np.min(lengths)), 1e-6))
     if not (config.min_length_ratio <= length_ratio <= config.max_length_ratio):
         return None
 
     angle_quality = max(0.0, 1.0 - angle / max(config.max_angle_degrees, 1e-6))
     cross_quality = max(
         0.0, 1.0 - cross_distance / max(config.max_cross_distance_pixels, 1e-6))
-    # 相邻段的中心距离通常接近一段灯带的长度。考虑到透视和局部遮挡的变化，
-    # 此项采用软评分。
-    distance_quality = math.exp(-abs(math.log(max(center_distance_ratio, 1e-6))))
+    gap_quality = max(
+        0.0, 1.0 - (gap_ratio - 1.0) / max(config.max_gap_ratio - 1.0, 1e-6))
+    length_quality = float(math.exp(-abs(math.log(max(length_ratio, 1e-6)))))
+    distance_quality = float(np.mean([
+        math.exp(-abs(math.log(max(value, 1e-6))))
+        for value in center_distance_ratios
+    ]))
     geometry_quality = float(np.clip(
-        0.45 * angle_quality + 0.35 * cross_quality + 0.20 * distance_quality,
+        0.30 * angle_quality +
+        0.25 * cross_quality +
+        0.20 * gap_quality +
+        0.15 * length_quality +
+        0.10 * distance_quality,
         0.0, 1.0))
-    return geometry_quality, angle, cross_distance, center_distance_ratio
+    return (
+        ordered,
+        geometry_quality,
+        angle,
+        cross_distance,
+        center_distance_ratio,
+        gap_ratio,
+    )
 
 
 def decode_protocol_candidates(
         strip_candidates: Sequence[StripDetection],
         protocol: FixedColorProtocol,
-        config: PairingConfig) -> List[ProtocolDetection]:
-    pairs: List[ProtocolDetection] = []
-    for index, left in enumerate(strip_candidates):
-        for right in strip_candidates[index + 1:]:
-            if left.color == right.color:
-                continue
-            geometry = _pair_geometry(left, right, config)
-            if geometry is None:
-                continue
-            ordered_left, ordered_right = _ordered_pair(left, right)
-            symbols = (ordered_left.color, ordered_right.color)
-            command_id = protocol.decode(symbols)
-            if command_id is None:
-                continue
-            geometry_quality, angle, cross_distance, center_distance_ratio = geometry
-            score = math.sqrt(max(left.score, 0.0) * max(right.score, 0.0))
-            score *= max(geometry_quality, 0.0)
-            if score < config.min_pair_score:
-                continue
-            confidence = math.sqrt(
-                max(ordered_left.confidence, 0.0) *
-                max(ordered_right.confidence, 0.0) *
-                max(geometry_quality, 0.0))
-            pairs.append(ProtocolDetection(
-                command_id=int(command_id),
-                symbols=symbols,
-                first=ordered_left,
-                second=ordered_right,
-                score=float(score),
-                confidence=float(confidence),
-                geometry_quality=geometry_quality,
-                angle_degrees=angle,
-                cross_distance=cross_distance,
-                center_distance_ratio=center_distance_ratio,
-            ))
-    pairs.sort(key=lambda item: item.score, reverse=True)
-    return pairs[:max(config.max_pairs, 1)]
+        config: ProtocolGeometryConfig) -> List[ProtocolDetection]:
+    code_length = max(int(protocol.code_length), 1)
+    if len(strip_candidates) < code_length:
+        return []
+
+    detections: List[ProtocolDetection] = []
+    for raw_segments in combinations(strip_candidates, code_length):
+        if len({item.color for item in raw_segments}) != code_length:
+            continue
+        geometry = _sequence_geometry(raw_segments, config)
+        if geometry is None:
+            continue
+        (
+            ordered_segments,
+            geometry_quality,
+            angle,
+            cross_distance,
+            center_distance_ratio,
+            gap_ratio,
+        ) = geometry
+        symbols = tuple(item.color for item in ordered_segments)
+        command_id = protocol.decode(symbols)
+        if command_id is None:
+            continue
+        segment_score = float(np.prod([
+            max(item.score, 0.0) for item in ordered_segments
+        ]) ** (1.0 / code_length))
+        score = segment_score * max(geometry_quality, 0.0)
+        if score < config.min_command_score:
+            continue
+        confidence = float(np.prod([
+            max(item.confidence, 0.0) for item in ordered_segments
+        ] + [max(geometry_quality, 0.0)]) ** (1.0 / (code_length + 1)))
+        detections.append(ProtocolDetection(
+            command_id=int(command_id),
+            symbols=symbols,
+            segments=ordered_segments,
+            score=float(score),
+            confidence=confidence,
+            geometry_quality=geometry_quality,
+            angle_degrees=angle,
+            cross_distance=cross_distance,
+            center_distance_ratio=center_distance_ratio,
+            gap_ratio=gap_ratio,
+        ))
+    detections.sort(key=lambda item: item.score, reverse=True)
+    return detections[:max(config.max_candidates, 1)]
 
 
 def select_protocol_winner(
@@ -198,30 +292,33 @@ def annotate_protocol(
     for rank, item in enumerate(protocol_candidates, 1):
         selected = item is winner
         color = (0, 255, 255) if selected else (0, 165, 255)
-        for segment in (item.first, item.second):
+        centers = []
+        for segment in item.segments:
             corners = np.round(segment.corners).astype(np.int32)
             cv2.polylines(output, [corners], True, color, 2)
-        center_a, _, _ = _axis(item.first)
-        center_b, _, _ = _axis(item.second)
-        cv2.line(
-            output,
-            tuple(np.round(center_a).astype(np.int32)),
-            tuple(np.round(center_b).astype(np.int32)),
-            color,
-            2)
-        anchor = tuple(np.round((center_a + center_b) * 0.5).astype(np.int32))
+            center, _ = _axis(segment)
+            centers.append(center)
+        for left, right in zip(centers, centers[1:]):
+            cv2.line(
+                output,
+                tuple(np.round(left).astype(np.int32)),
+                tuple(np.round(right).astype(np.int32)),
+                color,
+                2)
+        anchor = tuple(np.round(
+            np.mean(np.stack(centers, axis=0), axis=0)).astype(np.int32))
         text = (
-            f'#{rank} id={item.command_id} {item.symbols[0]}-{item.symbols[1]} '
+            f'#{rank} id={item.command_id} {"-".join(item.symbols)} '
             f'score={item.score:.3f} geo={item.geometry_quality:.2f}')
         cv2.putText(
             output, text, anchor, cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
 
     if winner is None:
-        title = f'{state}: no valid two-segment command'
+        title = f'{state}: no valid command'
     else:
         title = (
             f'{state}: id={winner.command_id} '
-            f'{winner.symbols[0]}-{winner.symbols[1]} '
+            f'{"-".join(winner.symbols)} '
             f'{confirmed_count}/{required_count} '
             f'score={winner.score:.3f}')
     cv2.putText(

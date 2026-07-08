@@ -2,10 +2,10 @@ import glob
 import os
 import subprocess
 import time
-from collections import Counter, deque
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, List, Optional
+from typing import Deque, List, Optional, Tuple
 
 import cv2
 import rclpy
@@ -50,10 +50,15 @@ class LedStripReceiver(Node):
         profile = validate_camera_profile(str(self.declare_parameter(
             'camera_profile', DEFAULT_CAMERA_PROFILE).value))
         self.classifier = classifier_for_profile(profile)
-        requested = str(self.declare_parameter('camera_device', 'auto').value)
-        width = int(self.declare_parameter('frame_width', 1280).value)
-        height = int(self.declare_parameter('frame_height', 720).value)
-        fps = max(float(self.declare_parameter('scan_rate_hz', 30.0).value), 1.0)
+        self.requested_device = str(self.declare_parameter('camera_device', 'auto').value)
+        self.frame_width = int(self.declare_parameter('frame_width', 1280).value)
+        self.frame_height = int(self.declare_parameter('frame_height', 720).value)
+        self.fps = max(float(self.declare_parameter('scan_rate_hz', 30.0).value), 1.0)
+        self.camera_required = bool(
+            self.declare_parameter('camera_required', True).value)
+        self.camera_retry_period = max(float(self.declare_parameter(
+            'camera_retry_period_sec', 1.0).value), 0.1)
+        self.last_camera_retry_time = 0.0
         self.preview = bool(self.declare_parameter('show_preview', True).value) and bool(
             os.environ.get('DISPLAY'))
         self.preview_scale = max(float(
@@ -76,7 +81,7 @@ class LedStripReceiver(Node):
             'camera_reject_keywords', 'Integrated,Chicony').value)
         self.reject_keywords = tuple(
             item.strip().lower() for item in reject.split(',') if item.strip())
-        controls = str(self.declare_parameter('v4l2_controls', '').value)
+        self.controls = str(self.declare_parameter('v4l2_controls', '').value)
         default_detector = str(detector_config_path(profile))
         configured_detector = str(self.declare_parameter(
             'detector_config', default_detector).value).strip()
@@ -101,33 +106,44 @@ class LedStripReceiver(Node):
         output_topic = str(self.declare_parameter(
             'output_topic', '/aruco_comm/rx_id').value)
         self.publisher = self.create_publisher(Int32, output_topic, 10)
+        self.reset_command_id = int(self.declare_parameter(
+            'reset_command_id', 0).value)
+        self.publish_reset_commands = bool(self.declare_parameter(
+            'publish_reset_commands', False).value)
         self.confirmation_window = max(int(self.declare_parameter(
             'confirmation_window', 7).value), 1)
         self.confirmation_required = max(int(self.declare_parameter(
             'confirmation_required', 5).value), 1)
         self.confirmation_required = min(
             self.confirmation_required, self.confirmation_window)
-        self.off_unlock_sec = max(float(self.declare_parameter(
-            'off_unlock_sec', 0.35).value), 0.0)
-        self.history: Deque[int] = deque(maxlen=self.confirmation_window)
-        self.locked = False
-        self.last_protocol_seen_time: Optional[float] = None
-        self.capture, self.device = self._open_camera(requested, width, height, fps)
-        self._apply_controls(self.device, controls)
+        self.max_confirm_latency_sec = max(float(self.declare_parameter(
+            'max_confirm_latency_sec', 0.20).value), 0.0)
+        self.history: Deque[Tuple[float, Optional[int]]] = deque(
+            maxlen=self.confirmation_window)
+        self.last_emitted_id: Optional[int] = None
+        self.capture = None
+        self.device = ''
+        self._ensure_camera(force=True)
         self.last_label = ''
-        self.create_timer(1.0 / fps, self._scan)
+        self.create_timer(1.0 / self.fps, self._scan)
         self.get_logger().info(
-            f'R2 LED vision ready: profile={profile}, camera={self.device}, '
+            f'R2 LED vision ready: profile={profile}, camera={self.device or "not-open"}, '
             f'config={config_path}, '
             f'processing_scale={self.processing_scale:g}, '
             f'colors={[item.name for item in self.config.colors]}, '
             f'output={output_topic}, confirm={self.confirmation_required}/'
-            f'{self.confirmation_window}')
+            f'{self.confirmation_window}, max_latency={self.max_confirm_latency_sec:g}s')
 
     def _scan(self) -> None:
+        if not self._ensure_camera():
+            return
+        assert self.capture is not None
         ok, frame = _read_camera_frame(self.capture)
         if not ok or frame is None:
-            self.get_logger().warning('camera frame unavailable')
+            self.get_logger().warning('camera frame unavailable; reopening')
+            self.capture.release()
+            self.capture = None
+            self.device = ''
             return
         work = frame
         scale = self.processing_scale
@@ -137,25 +153,22 @@ class LedStripReceiver(Node):
         if scale < 1.0:
             inverse = 1.0 / scale
             candidates = [item.scaled(inverse) for item in candidates]
-        single_winner = self.classifier.select_winner(candidates, self.config)
         protocol_candidates = decode_protocol_candidates(
             candidates, self.protocol, self.pairing_config)
         protocol_winner = select_protocol_winner(
             protocol_candidates, self.protocol_margin)
         confirmed_count = self._update_protocol_state(protocol_winner)
-        self._save_positive_frame(frame, single_winner)
+        self._save_positive_frame(frame, protocol_winner)
         if protocol_winner is None:
-            label = f'{"LOCK" if self.locked else "WAIT"}:NONE'
+            label = 'WAIT:NONE'
         else:
-            label = (
-                f'{"LOCK" if self.locked else "WAIT"}:'
-                f'{protocol_winner.command_id}:{confirmed_count}')
+            label = f'WAIT:{protocol_winner.command_id}:{confirmed_count}'
         if label != self.last_label:
             if protocol_winner is None:
                 self.get_logger().info(
                     f'command=NONE strip_candidates={len(candidates)} '
                     f'protocol_candidates={len(protocol_candidates)} '
-                    f'state={"LOCK" if self.locked else "WAIT"}')
+                    f'state=WAIT')
             else:
                 different = next(
                     (item for item in protocol_candidates[1:]
@@ -171,15 +184,16 @@ class LedStripReceiver(Node):
                     f'confidence={protocol_winner.confidence:.3f} '
                     f'score={protocol_winner.score:.3f} margin={margin:.3f} '
                     f'confirm={confirmed_count}/{self.confirmation_required} '
-                    f'state={"LOCK" if self.locked else "WAIT"}')
+                    f'state=WAIT')
             self.last_label = label
         if self.preview:
+            single_winner = self.classifier.select_winner(candidates, self.config)
             rendered = self.classifier.annotate(frame, candidates, single_winner)
             rendered = annotate_protocol(
                 rendered,
                 protocol_candidates,
                 protocol_winner,
-                'LOCK' if self.locked else 'WAIT',
+                'WAIT',
                 confirmed_count,
                 self.confirmation_required,
             )
@@ -192,30 +206,38 @@ class LedStripReceiver(Node):
 
     def _update_protocol_state(self, winner) -> int:
         now = time.monotonic()
+        command_id = None if winner is None else int(winner.command_id)
+        if command_id is not None:
+            existing = {value for _, value in self.history if value is not None}
+            if existing and existing != {command_id}:
+                self.history.clear()
+        self.history.append((now, command_id))
+        if self.max_confirm_latency_sec > 0.0:
+            cutoff = now - self.max_confirm_latency_sec
+            while self.history and self.history[0][0] < cutoff:
+                self.history.popleft()
         if winner is None:
-            self.history.clear()
+            return 0
+
+        confirmed_count = sum(1 for _, value in self.history if value == command_id)
+        if (
+                confirmed_count >= self.confirmation_required and
+                command_id != self.last_emitted_id):
             if (
-                    self.locked and self.last_protocol_seen_time is not None and
-                    now - self.last_protocol_seen_time >= self.off_unlock_sec):
-                self.locked = False
-                self.get_logger().info('protocol lock released')
-            return 0
-
-        self.last_protocol_seen_time = now
-        if self.locked:
-            return 0
-
-        self.history.append(winner.command_id)
-        counts = Counter(self.history)
-        confirmed_count = counts[winner.command_id]
-        if confirmed_count >= self.confirmation_required:
+                    command_id == self.reset_command_id and
+                    not self.publish_reset_commands):
+                self.last_emitted_id = command_id
+                self.history.clear()
+                self.get_logger().info(
+                    f'confirmed reset command {command_id}; state cleared locally')
+                return confirmed_count
             message = Int32()
-            message.data = int(winner.command_id)
+            message.data = command_id
             self.publisher.publish(message)
-            self.locked = True
+            self.last_emitted_id = command_id
             self.history.clear()
             self.get_logger().info(
-                f'published confirmed command {winner.command_id}: '
+                f'published confirmed command {command_id}: '
                 f'{winner.symbols}')
         return confirmed_count
 
@@ -235,8 +257,9 @@ class LedStripReceiver(Node):
         if not should_save:
             return
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        symbols = ''.join(symbol[0] for symbol in winner.symbols)
         filename = (
-            f'{winner.color.lower()}_{timestamp}_'
+            f'{symbols.lower()}_{timestamp}_'
             f'conf{winner.confidence:.3f}_score{winner.score:.3f}.jpg'
         )
         path = self.positive_capture_dir / filename
@@ -264,6 +287,27 @@ class LedStripReceiver(Node):
             capture.release()
         raise RuntimeError(
             f'cannot open camera {requested}; attempted={failures}')
+
+    def _ensure_camera(self, force: bool = False) -> bool:
+        if self.capture is not None:
+            return True
+        now = time.monotonic()
+        if not force and now - self.last_camera_retry_time < self.camera_retry_period:
+            return False
+        self.last_camera_retry_time = now
+        try:
+            self.capture, self.device = self._open_camera(
+                self.requested_device, self.frame_width, self.frame_height, self.fps)
+            self._apply_controls(self.device, self.controls)
+            self.get_logger().info(f'camera opened: {self.device}')
+            return True
+        except RuntimeError as exc:
+            if self.camera_required:
+                raise
+            self.get_logger().warning(f'{exc}; will retry')
+            self.capture = None
+            self.device = ''
+            return False
 
     def _camera_candidates(self, requested: str) -> List[str]:
         if requested != 'auto':
@@ -304,7 +348,8 @@ class LedStripReceiver(Node):
                     f'camera control {assignment} failed: {message}')
 
     def destroy_node(self):
-        self.capture.release()
+        if self.capture is not None:
+            self.capture.release()
         if self.preview:
             cv2.destroyAllWindows()
         return super().destroy_node()

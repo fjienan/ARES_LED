@@ -1,7 +1,7 @@
 # R1/R2 LED 光学通信
 
-本仓库用 LED 灯带替代原 ArUco 屏幕通信。R1 负责显示两段颜色命令；R2 负责识别
-RED/GREEN/BLUE/CYAN/PURPLE 单色灯带候选，并将两段候选按 shared 协议解码为命令 ID。
+本仓库用 LED 灯带替代原 ArUco 屏幕通信。R1 负责显示三段颜色命令；R2 负责识别
+RED/GREEN/BLUE/PURPLE 单色灯带候选，并将三段候选按 shared 协议解码为命令 ID。
 
 ## 目录
 
@@ -33,33 +33,33 @@ JSON 状态帧。
 git clone <本仓库地址>
 ```
 
-## R1/R2 两段五色通信协议
+## R1/R2 三段四色通信协议
 
-R1 只点亮灯带前两段，后面的灯带全部置灭。每段只使用
-`RED/GREEN/BLUE/CYAN/PURPLE` 五种高饱和颜色；同一命令的两段颜色必须不同。
-协议允许正反等价，因此 R2 解码时 `RED,GREEN` 和 `GREEN,RED` 视为同一命令。
+R1 使用 6 个物理段显示同一个三段协议码：`0,1,2` 为低亮度组，`3,4,5` 为高亮度组。
+每段只使用 `RED/GREEN/BLUE/PURPLE` 四种颜色；同一命令的三段颜色必须全部不同。
+协议只认正向顺序，不做正反等价。
 
 | 符号 | 颜色 | RGB |
 |---|---|---:|
 | RED | 红 | R1 本地配置 |
 | GREEN | 绿 | R1 本地配置 |
 | BLUE | 蓝 | R1 本地配置 |
-| CYAN | 青 | R1 本地配置 |
 | PURPLE | 紫 | R1 本地配置 |
 
-| 命令 ID | 两段颜色 |
+| 命令 ID | 三段颜色 |
 |---:|:---:|
-| 0 | RED, GREEN |
-| 1 | RED, BLUE |
-| 2 | RED, CYAN |
-| 3 | RED, PURPLE |
-| 4 | GREEN, BLUE |
-| 5 | GREEN, CYAN |
-| 6 | GREEN, PURPLE |
-| 7 | BLUE, CYAN |
-| 8 | BLUE, PURPLE |
+| 0 | BLUE, PURPLE, RED |
+| 1 | BLUE, RED, GREEN |
+| 2 | BLUE, GREEN, PURPLE |
+| 3 | RED, GREEN, BLUE |
+| 4 | PURPLE, BLUE, GREEN |
+| 5 | RED, BLUE, PURPLE |
+| 6 | GREEN, PURPLE, BLUE |
+| 7 | GREEN, RED, PURPLE |
+| 8 | RED, PURPLE, GREEN |
 
-命令 `0` 是普通通信命令，不再表示清空。R2 会多帧确认后发布命令 ID。
+命令 `0` 是内部重置命令。R2 确认 `0` 后只清除去重状态，不向 `/aruco_comm/rx_id`
+发布；它用于让相邻两个相同动作 ID 可以再次触发。
 
 ## R1 构建与启动
 
@@ -107,7 +107,20 @@ serial_device: auto
 
 WLED 灯带连接：24V 电源正极接灯带 `+`，电源负极接灯带 `GND`，WLED `GND` 与灯带
 `GND` 共地，WLED `DO` 接灯带 `DIN`。不要把 24V 接到 WLED 板的 5V。
-发送命令后，前两段会一直保持对应颜色，直到收到下一条命令；后面的段会被发送端置灭。
+发送命令后，前 6 个物理段会一直保持对应颜色，直到收到下一条命令；后面的段会被发送端置灭。
+
+六段显示顺序在 `r1_ws/src/rgb_led_sender/config/sender.yaml` 中配置：
+
+```yaml
+low_segments: [0, 1, 2]
+low_brightness: 6.0
+low_reverse_order: false
+high_segments: [3, 4, 5]
+high_brightness: 60.0
+high_reverse_order: false
+```
+
+如某一组物理接线方向相反，只改对应的 `*_reverse_order: true`。
 
 发送测试命令：
 
@@ -153,13 +166,36 @@ colcon build --base-paths src ../shared/src \
   --packages-select rgb_comm_protocol rgb_camera_receiver \
   --cmake-args -DPYTHON_EXECUTABLE=/usr/bin/python3 -DPython3_EXECUTABLE=/usr/bin/python3
 source install/setup.bash
-ros2 launch rgb_camera_receiver r2_led_vision.launch.py
+ros2 launch rgb_camera_receiver r2_dual_led_vision.launch.py
 ```
 
-`camera_device: auto` 会忽略名称包含 Integrated/Chicony 的内置摄像头，并选择首个
-能输出彩色图像的外接摄像头。默认 profile 是 `usb_rgb_1`。
+双摄像头配置在 `r2_ws/src/rgb_camera_receiver/config/dual_receiver.yaml`。
+不要在双摄像头配置中使用 `auto`；先查清楚稳定设备路径：
 
-如需显式指定 profile：
+```bash
+v4l2-ctl --list-devices
+ls -l /dev/v4l/by-id/
+ls -l /dev/v4l/by-path/
+```
+
+然后把对应路径填入：
+
+```yaml
+camera_slots:
+  camera_1:
+    profile: usb_rgb_1
+    device: /dev/v4l/by-path/CHANGE_ME_CAMERA_1
+    required: false
+  camera_2:
+    profile: usb_rgb_2
+    device: /dev/v4l/by-path/CHANGE_ME_CAMERA_2
+    required: false
+```
+
+如果两台摄像头型号相同，优先使用 `/dev/v4l/by-path/`，它和 USB 口绑定，更容易区分。
+`required: false` 表示只连接一台摄像头也允许启动测试。
+
+如需单独调试某一个 profile：
 
 ```bash
 ros2 launch rgb_camera_receiver r2_led_vision.launch.py camera_profile:=usb_rgb_1
@@ -173,6 +209,7 @@ ros2 launch rgb_camera_receiver r2_led_vision.launch.py camera_profile:=usb_rgb_
 
 每台相机的运行参数在 `config/cameras/<profile>/receiver.yaml`，R2 专用颜色及几何模型在
 `config/cameras/<profile>/detector.yaml`；这些参数与 R1 输出 RGB 完全独立。
+R2 按“处理帧”确认命令，默认最近 4 次处理结果中 3 次一致才确认，最长确认窗口 0.20 秒。
 
 离线处理全部标注数据并生成逐图结果：
 
@@ -203,5 +240,5 @@ source /opt/ros/humble/setup.bash
   r2_ws/src/rgb_camera_receiver/test
 ```
 
-当前硬性回归集为单色图像数据集：五种颜色必须全部识别正确，NONE 必须全部零候选。
-R2 另有两段协议解码单元测试。
+当前硬性回归集为单色图像数据集：有效颜色必须全部识别正确，NONE 必须全部零候选。
+R2 另有三段协议解码单元测试。

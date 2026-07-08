@@ -36,6 +36,8 @@ coverage.xml
 htmlcov/
 camera_capture_results/
 camera_capture_positive/
+camera_capture_positive*/
+camera_results/
 .venv/
 venv/
 env/

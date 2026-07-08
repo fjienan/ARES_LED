@@ -16,7 +16,7 @@ PACKAGE = Path(__file__).resolve().parents[1]
 PROTOCOL = FixedColorProtocol(
     config_path=str(PACKAGE.parents[2] / 'shared' / 'src' /
                     'rgb_comm_protocol' / 'config' / 'rgb_protocol.yaml'))
-CONFIG = PairingConfig(min_pair_score=0.01)
+CONFIG = PairingConfig(min_command_score=0.01)
 
 
 def strip(color: str, center_x: float, center_y: float = 100.0) -> StripDetection:
@@ -45,31 +45,36 @@ def strip(color: str, center_x: float, center_y: float = 100.0) -> StripDetectio
     )
 
 
-def test_decodes_two_segment_command():
+def test_decodes_three_segment_command():
     candidates = decode_protocol_candidates(
-        [strip('RED', 100), strip('BLUE', 190)], PROTOCOL, CONFIG)
+        [strip('BLUE', 100), strip('RED', 190), strip('GREEN', 280)],
+        PROTOCOL,
+        CONFIG)
     winner = select_protocol_winner(candidates, margin=1.0)
     assert winner is not None
     assert winner.command_id == 1
-    assert winner.symbols == ('RED', 'BLUE')
+    assert winner.symbols == ('BLUE', 'RED', 'GREEN')
 
 
-def test_reverse_order_has_same_meaning():
+def test_reverse_order_is_not_decoded():
     candidates = decode_protocol_candidates(
-        [strip('RED', 190), strip('BLUE', 100)], PROTOCOL, CONFIG)
-    winner = select_protocol_winner(candidates, margin=1.0)
-    assert winner is not None
-    assert winner.command_id == 1
-    assert set(winner.symbols) == {'RED', 'BLUE'}
-
-
-def test_invalid_protocol_pair_is_rejected():
-    candidates = decode_protocol_candidates(
-        [strip('RED', 100), strip('RED', 190)], PROTOCOL, CONFIG)
+        [strip('BLUE', 280), strip('RED', 190), strip('GREEN', 100)],
+        PROTOCOL,
+        CONFIG)
     assert candidates == []
 
 
-def test_non_collinear_pair_is_rejected():
+def test_invalid_protocol_sequence_is_rejected():
     candidates = decode_protocol_candidates(
-        [strip('RED', 100, 80), strip('BLUE', 190, 180)], PROTOCOL, CONFIG)
+        [strip('RED', 100), strip('RED', 190), strip('BLUE', 280)],
+        PROTOCOL,
+        CONFIG)
+    assert candidates == []
+
+
+def test_non_collinear_sequence_is_rejected():
+    candidates = decode_protocol_candidates(
+        [strip('BLUE', 100, 80), strip('RED', 190, 180), strip('GREEN', 280, 100)],
+        PROTOCOL,
+        CONFIG)
     assert candidates == []
