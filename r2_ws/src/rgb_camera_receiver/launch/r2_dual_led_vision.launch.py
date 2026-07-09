@@ -16,6 +16,57 @@ def _as_bool(value, default=False):
     return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def _receiver_params(package_share: Path, profile: str):
+    receiver_path = package_share / 'config' / 'cameras' / profile / 'receiver.yaml'
+    with receiver_path.open('r', encoding='utf-8') as stream:
+        raw = yaml.safe_load(stream) or {}
+    return dict(
+        (raw.get('rgb_camera_receiver', {}) or {}).get('ros__parameters', {}) or {})
+
+
+def _copy_slot_overrides(params, slot):
+    int_keys = {
+        'frame_width',
+        'frame_height',
+        'camera_buffer_size',
+        'reset_command_id',
+        'confirmation_window',
+        'confirmation_required',
+    }
+    float_keys = {
+        'scan_rate_hz',
+        'camera_fps',
+        'processing_scale',
+        'preview_scale',
+        'positive_save_interval_sec',
+        'max_confirm_latency_sec',
+        'protocol_winner_margin',
+    }
+    bool_keys = {
+        'show_preview',
+        'save_positive_images',
+    }
+    string_keys = {
+        'camera_fourcc',
+        'positive_capture_dir',
+        'v4l2_controls',
+        'detector_config',
+        'protocol_config',
+    }
+    for key in int_keys:
+        if key in slot:
+            params[key] = int(slot[key])
+    for key in float_keys:
+        if key in slot:
+            params[key] = float(slot[key])
+    for key in bool_keys:
+        if key in slot:
+            params[key] = _as_bool(slot[key], bool(params.get(key, False)))
+    for key in string_keys:
+        if key in slot:
+            params[key] = str(slot[key])
+
+
 def _launch_setup(context):
     package_share = Path(get_package_share_directory('rgb_camera_receiver'))
     config_path = Path(LaunchConfiguration('dual_config').perform(context)).expanduser()
@@ -33,33 +84,21 @@ def _launch_setup(context):
         profile = str(slot['profile'])
         topic = f'/rgb_camera_receiver/{name}/confirmed_id'
         input_topics.append(topic)
-        params = {
+        params = _receiver_params(package_share, profile)
+        params.update({
             'camera_profile': profile,
             'camera_device': str(slot['device']),
             'camera_required': _as_bool(slot.get('required', False), False),
-            'show_preview': _as_bool(slot.get('show_preview', True), True),
             'output_topic': topic,
             'publish_reset_commands': True,
-            'positive_capture_dir': (
-                f'~/Desktop/LED/camera_capture_positive_{profile}_protocol'),
-        }
-        if 'frame_width' in slot:
-            params['frame_width'] = int(slot['frame_width'])
-        if 'frame_height' in slot:
-            params['frame_height'] = int(slot['frame_height'])
-        if 'scan_rate_hz' in slot:
-            params['scan_rate_hz'] = float(slot['scan_rate_hz'])
-        if 'processing_scale' in slot:
-            params['processing_scale'] = float(slot['processing_scale'])
+        })
+        _copy_slot_overrides(params, slot)
         actions.append(Node(
             package='rgb_camera_receiver',
             executable='rgb_camera_receiver',
             name=f'rgb_camera_receiver_{name}',
             output='screen',
-            parameters=[
-                str(package_share / 'config' / 'cameras' / profile / 'receiver.yaml'),
-                params,
-            ],
+            parameters=[params],
         ))
 
     arbiter = config.get('arbiter', {})

@@ -25,9 +25,9 @@ class CommandArbiter(Node):
             'reset_command_id', 0).value)
         self.last_published_id: Optional[int] = None
         self.publisher = self.create_publisher(Int32, output_topic, 10)
-        self.subscriptions = []
+        self._command_subscriptions = []
         for topic in input_topics:
-            self.subscriptions.append(
+            self._command_subscriptions.append(
                 self.create_subscription(
                     Int32,
                     topic,

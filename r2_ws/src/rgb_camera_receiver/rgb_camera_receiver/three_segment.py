@@ -1,4 +1,4 @@
-"""Shared three-segment detector used by usb_rgb_2 live tools and ROS nodes."""
+"""Legacy three-segment detector used by the old usb_rgb_2 ROS path."""
 
 from dataclasses import dataclass
 from functools import cmp_to_key
@@ -488,7 +488,7 @@ def detect_three_segments(
     return candidates
 
 
-def detect_three_segment_frame(
+def detect_three_segment_frame_old(
         frame,
         classifier,
         detector_config,

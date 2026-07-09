@@ -1,6 +1,7 @@
 import glob
 import os
 import subprocess
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -30,7 +31,7 @@ from .profiles import (
 )
 from .three_segment import (
     annotate_three_segments,
-    detect_three_segment_frame,
+    detect_three_segment_frame_old,
     load_three_segment_config,
 )
 from .three_segment_protocol import (
@@ -78,7 +79,14 @@ class LedStripReceiver(Node):
         self.requested_device = str(self.declare_parameter('camera_device', 'auto').value)
         self.frame_width = int(self.declare_parameter('frame_width', 1280).value)
         self.frame_height = int(self.declare_parameter('frame_height', 720).value)
-        self.fps = max(float(self.declare_parameter('scan_rate_hz', 30.0).value), 1.0)
+        self.scan_rate_hz = max(float(
+            self.declare_parameter('scan_rate_hz', 30.0).value), 1.0)
+        self.camera_fps = max(float(
+            self.declare_parameter('camera_fps', 30.0).value), 1.0)
+        self.camera_fourcc = str(
+            self.declare_parameter('camera_fourcc', '').value).strip().upper()
+        self.camera_buffer_size = int(
+            self.declare_parameter('camera_buffer_size', 0).value)
         self.camera_required = bool(
             self.declare_parameter('camera_required', True).value)
         self.camera_retry_period = max(float(self.declare_parameter(
@@ -143,9 +151,9 @@ class LedStripReceiver(Node):
         self.publish_reset_commands = bool(self.declare_parameter(
             'publish_reset_commands', False).value)
         self.confirmation_window = max(int(self.declare_parameter(
-            'confirmation_window', 7).value), 1)
+            'confirmation_window', 2).value), 1)
         self.confirmation_required = max(int(self.declare_parameter(
-            'confirmation_required', 5).value), 1)
+            'confirmation_required', 2).value), 1)
         self.confirmation_required = min(
             self.confirmation_required, self.confirmation_window)
         self.max_confirm_latency_sec = max(float(self.declare_parameter(
@@ -155,12 +163,21 @@ class LedStripReceiver(Node):
         self.last_emitted_id: Optional[int] = None
         self.capture = None
         self.device = ''
+        self.capture_lock = threading.Lock()
+        self.capture_stop = threading.Event()
+        self.capture_thread: Optional[threading.Thread] = None
+        self.latest_frame = None
+        self.latest_frame_seq = 0
+        self.last_processed_frame_seq = 0
         self._ensure_camera(force=True)
         self.last_label = ''
-        self.create_timer(1.0 / self.fps, self._scan)
+        self.create_timer(1.0 / self.scan_rate_hz, self._scan)
         self.get_logger().info(
             f'R2 LED vision ready: profile={profile}, camera={self.device or "not-open"}, '
             f'config={config_path}, '
+            f'camera_fps={self.camera_fps:g}, scan_rate_hz={self.scan_rate_hz:g}, '
+            f'fourcc={self.camera_fourcc or "default"}, '
+            f'buffer={self.camera_buffer_size if self.camera_buffer_size > 0 else "default"}, '
             f'processing_scale={self.processing_scale:g}, '
             f'colors={[item.name for item in self.config.colors]}, '
             f'output={output_topic}, confirm={self.confirmation_required}/'
@@ -169,18 +186,16 @@ class LedStripReceiver(Node):
     def _scan(self) -> None:
         if not self._ensure_camera():
             return
-        assert self.capture is not None
-        ok, frame = _read_camera_frame(self.capture)
-        if not ok or frame is None:
-            self.get_logger().warning('camera frame unavailable; reopening')
-            self.capture.release()
-            self.capture = None
-            self.device = ''
+        frame, frame_seq = self._latest_frame_snapshot()
+        if frame is None:
             return
+        if frame_seq == self.last_processed_frame_seq:
+            return
+        self.last_processed_frame_seq = frame_seq
         triples = []
         if self.profile == 'usb_rgb_2':
             assert self.three_segment_config is not None
-            strong, weak, candidates, triples = detect_three_segment_frame(
+            strong, weak, candidates, triples = detect_three_segment_frame_old(
                 frame,
                 self.classifier,
                 self.config,
@@ -328,6 +343,10 @@ class LedStripReceiver(Node):
         else:
             self.get_logger().error(f'failed to save positive frame: {path}')
 
+    def _latest_frame_snapshot(self):
+        with self.capture_lock:
+            return self.latest_frame, self.latest_frame_seq
+
     def _open_camera(self, requested: str, width: int, height: int, fps: float):
         failures: List[str] = []
         for device in self._camera_candidates(requested):
@@ -336,37 +355,104 @@ class LedStripReceiver(Node):
                 failures.append(device)
                 capture.release()
                 continue
+            if self.camera_fourcc:
+                if len(self.camera_fourcc) == 4:
+                    capture.set(
+                        cv2.CAP_PROP_FOURCC,
+                        cv2.VideoWriter_fourcc(*self.camera_fourcc))
+                else:
+                    self.get_logger().warning(
+                        f'ignoring invalid camera_fourcc={self.camera_fourcc!r}')
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             capture.set(cv2.CAP_PROP_FPS, fps)
+            if self.camera_buffer_size > 0:
+                capture.set(cv2.CAP_PROP_BUFFERSIZE, self.camera_buffer_size)
             ok, frame = _read_camera_frame(capture)
             if ok and frame is not None and frame.ndim == 3 and frame.shape[2] == 3:
-                return capture, device
+                return capture, device, frame
             failures.append(device)
             capture.release()
         raise RuntimeError(
             f'cannot open camera {requested}; attempted={failures}')
 
     def _ensure_camera(self, force: bool = False) -> bool:
-        if self.capture is not None:
+        with self.capture_lock:
+            capture_open = self.capture is not None
+        if capture_open:
+            self._start_capture_thread()
             return True
         now = time.monotonic()
         if not force and now - self.last_camera_retry_time < self.camera_retry_period:
             return False
         self.last_camera_retry_time = now
         try:
-            self.capture, self.device = self._open_camera(
-                self.requested_device, self.frame_width, self.frame_height, self.fps)
-            self._apply_controls(self.device, self.controls)
-            self.get_logger().info(f'camera opened: {self.device}')
+            capture, device, frame = self._open_camera(
+                self.requested_device, self.frame_width, self.frame_height,
+                self.camera_fps)
+            self._apply_controls(device, self.controls)
+            with self.capture_lock:
+                self.capture = capture
+                self.device = device
+                self.latest_frame = frame
+                self.latest_frame_seq += 1
+            self._start_capture_thread()
+            self.get_logger().info(
+                f'camera opened: {device} camera_fps={self.camera_fps:g}')
             return True
         except RuntimeError as exc:
             if self.camera_required:
                 raise
             self.get_logger().warning(f'{exc}; will retry')
-            self.capture = None
-            self.device = ''
+            with self.capture_lock:
+                self.capture = None
+                self.device = ''
+                self.latest_frame = None
             return False
+
+    def _start_capture_thread(self) -> None:
+        thread = self.capture_thread
+        if thread is not None and thread.is_alive():
+            return
+        self.capture_stop.clear()
+        self.capture_thread = threading.Thread(
+            target=self._capture_loop,
+            name=f'{self.get_name()}_capture',
+            daemon=True)
+        self.capture_thread.start()
+
+    def _capture_loop(self) -> None:
+        current = threading.current_thread()
+        try:
+            while not self.capture_stop.is_set():
+                with self.capture_lock:
+                    capture = self.capture
+                if capture is None:
+                    return
+                ok, frame = _read_camera_frame(capture)
+                if self.capture_stop.is_set():
+                    return
+                if not ok or frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+                    with self.capture_lock:
+                        active = self.capture is capture
+                        if active:
+                            self.capture = None
+                            self.device = ''
+                            self.latest_frame = None
+                    if active:
+                        capture.release()
+                        self.get_logger().warning(
+                            'camera frame unavailable; will reopen')
+                    return
+                with self.capture_lock:
+                    if self.capture is not capture:
+                        return
+                    self.latest_frame = frame
+                    self.latest_frame_seq += 1
+        finally:
+            with self.capture_lock:
+                if self.capture_thread is current:
+                    self.capture_thread = None
 
     def _camera_candidates(self, requested: str) -> List[str]:
         if requested != 'auto':
@@ -407,8 +493,21 @@ class LedStripReceiver(Node):
                     f'camera control {assignment} failed: {message}')
 
     def destroy_node(self):
-        if self.capture is not None:
-            self.capture.release()
+        self.capture_stop.set()
+        thread = self.capture_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        with self.capture_lock:
+            capture = self.capture
+            self.capture = None
+            self.device = ''
+            self.latest_frame = None
+        if capture is not None:
+            capture.release()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+            if thread.is_alive():
+                self.get_logger().warning('capture thread did not stop cleanly')
         if self.preview:
             cv2.destroyAllWindows()
         return super().destroy_node()

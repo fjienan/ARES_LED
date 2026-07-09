@@ -184,7 +184,13 @@ source install/setup.bash
 ros2 launch rgb_camera_receiver r2_dual_led_vision.launch.py
 ```
 
-双摄像头配置在 `r2_ws/src/rgb_camera_receiver/config/dual_receiver.yaml`。
+`colcon build` 会把 launch 和 config 安装到 `install/`。修改 `config/`、`launch/`
+或 Python 节点后，需要重新构建并重新 `source install/setup.bash` 再启动。
+
+双摄像头配置在 `r2_ws/src/rgb_camera_receiver/config/dual_receiver.yaml`。双摄像头
+launch 会先读取 `config/cameras/<profile>/receiver.yaml`，再用 `dual_receiver.yaml`
+中对应 slot 的字段覆盖；因此即使节点名变成 `rgb_camera_receiver_camera_1`，profile
+默认参数也会生效。
 不要在双摄像头配置中使用 `auto`；先查清楚摄像头枚举结果和稳定设备路径：
 
 ```bash
@@ -221,15 +227,41 @@ camera_slots:
     profile: usb_rgb_1
     device: /dev/v4l/by-id/usb-xxx-camera-A-video-index0
     required: false
+    frame_width: 2560
+    frame_height: 1440
+    camera_fps: 30.0
+    scan_rate_hz: 30.0
+    camera_fourcc: MJPG
+    camera_buffer_size: 1
+    show_preview: true
+    preview_scale: 0.45
+    processing_scale: 0.0
 
   camera_2:
     enabled: true
     profile: usb_rgb_2
     device: /dev/v4l/by-id/usb-yyy-camera-B-video-index0
     required: false
+    camera_fps: 30.0
+    scan_rate_hz: 20.0
+    show_preview: true
 ```
 
 `required: false` 表示只连接一台摄像头也允许启动测试。
+启动后可以确认第一台相机的关键参数是否和
+`camera_capture/detect_usb_rgb_1_three_segment_live.py` 一致：
+
+```bash
+ros2 param get /rgb_camera_receiver_camera_1 frame_width
+ros2 param get /rgb_camera_receiver_camera_1 frame_height
+ros2 param get /rgb_camera_receiver_camera_1 camera_fps
+ros2 param get /rgb_camera_receiver_camera_1 scan_rate_hz
+ros2 param get /rgb_camera_receiver_camera_1 camera_fourcc
+ros2 param get /rgb_camera_receiver_camera_1 camera_buffer_size
+ros2 param get /rgb_camera_receiver_camera_1 preview_scale
+```
+
+期望值分别为 `2560`、`1440`、`30.0`、`30.0`、`MJPG`、`1`、`0.45`。
 
 如需单独调试某一个 profile：
 
@@ -245,7 +277,8 @@ ros2 launch rgb_camera_receiver r2_led_vision.launch.py camera_profile:=usb_rgb_
 
 每台相机的运行参数在 `config/cameras/<profile>/receiver.yaml`，R2 专用颜色及几何模型在
 `config/cameras/<profile>/detector.yaml`；这些参数与 R1 输出 RGB 完全独立。
-R2 按“处理帧”确认命令，默认最近 4 次处理结果中 3 次一致才确认，最长确认窗口 0.20 秒。
+R2 按“处理帧”确认命令，当前默认连续 2 次处理结果一致才确认；
+`usb_rgb_1` 最长确认窗口 0.30 秒，`usb_rgb_2` 为 0.25 秒。
 
 离线处理全部标注数据并生成逐图结果：
 

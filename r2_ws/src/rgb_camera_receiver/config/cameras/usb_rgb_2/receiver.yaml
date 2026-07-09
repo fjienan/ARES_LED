@@ -12,32 +12,33 @@ rgb_camera_receiver:
     camera_reject_keywords: Integrated,Chicony
     frame_width: 1280
     frame_height: 720
-    scan_rate_hz: 30.0
+    # camera_fps 是相机采集线程请求的帧率；scan_rate_hz 是检测频率。
+    camera_fps: 30.0
+    scan_rate_hz: 20.0
 
     # 默认为空，因为部分 USB 摄像头不提供 V4L2 控制项。
     # 支持时格式为：auto_exposure=1,exposure_time_absolute=100,gain=0
     v4l2_controls: ""
 
-    show_preview: true
+    show_preview: false
     preview_scale: 0.5
     # 与 detector.yaml 的离线验收缩放比例保持一致。
     processing_scale: 0.4
 
     # 检测器选出阳性结果时保存摄像头原始画面。连续阳性期间立即保存第一帧，
     # 后续画面最多每秒保存一张。
-    save_positive_images: true
+    save_positive_images: false
     positive_capture_dir: ~/Desktop/LED/camera_capture_positive_usb_rgb_2
     positive_save_interval_sec: 1.0
 
-    # 发布前通过多次“已处理帧”确认解码出的三段协议命令。
-    # 摄像头可以是 30 Hz；检测忙时会丢弃旧帧，只处理最新帧，避免延迟堆积。
+    # 连续 2 帧“已处理帧”解码为同一三段协议命令后确认发布。
     protocol_config: ""
     output_topic: /aruco_comm/rx_id
     reset_command_id: 0
     # 单 receiver 直接输出时不发布 0；双摄像头 launch 会覆盖为 true，
     # 让 arbiter 接收 0 后执行内部解锁。
     publish_reset_commands: false
-    confirmation_window: 4
-    confirmation_required: 3
-    max_confirm_latency_sec: 0.20
+    confirmation_window: 2
+    confirmation_required: 2
+    max_confirm_latency_sec: 0.25
     protocol_winner_margin: 1.20
