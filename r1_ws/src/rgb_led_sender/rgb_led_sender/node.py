@@ -138,6 +138,8 @@ class RgbLedSender(Node):
             'brightness_mode', 'segment_bri').value)
         self.wled_master_brightness = float(
             self.declare_parameter('wled_master_brightness', 255.0).value)
+        self.initial_command_id = int(
+            self.declare_parameter('initial_command_id', 0).value)
         self.display_segments = build_triplet_segment_specs(
             self.protocol.code_length,
             self.low_segments,
@@ -160,6 +162,7 @@ class RgbLedSender(Node):
         if self.transport != 'serial':
             raise ValueError("transport must be 'serial'")
         self._init_serial_transport()
+        self._queue_initial_command()
 
         self.create_subscription(Int32, topic, self._on_command, 10)
         self.create_timer(max(retry_period, 0.05), self._dispatch)
@@ -176,6 +179,15 @@ class RgbLedSender(Node):
             self.declare_parameter('serial_baudrate', 115200).value)
         self.serial_timeout_sec = float(
             self.declare_parameter('serial_timeout_sec', 0.05).value)
+
+    def _queue_initial_command(self) -> None:
+        if self.initial_command_id < 0:
+            return
+        if self.protocol.encode_symbols(self.initial_command_id) is None:
+            self.get_logger().warning(
+                f'initial command ID {self.initial_command_id} is not in RGB protocol; skipped')
+            return
+        self.pending_id = self.initial_command_id
 
     def _on_command(self, message: Int32) -> None:
         command = int(message.data)

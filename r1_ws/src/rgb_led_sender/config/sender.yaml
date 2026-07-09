@@ -26,5 +26,7 @@ rgb_led_sender:
     # 使用每段 bri 时，全局主亮度保持 255，实际亮度由各段 bri 控制。
     wled_master_brightness: 255.0
     retry_period_sec: 0.5
+    # 启动后默认刷成内部重置命令 0 的颜色；设为 -1 可禁用。
+    initial_command_id: 0
     # R1 物理输出的 RGB 配置，与 R2 摄像头观测值无关。
     colors_config: ""
