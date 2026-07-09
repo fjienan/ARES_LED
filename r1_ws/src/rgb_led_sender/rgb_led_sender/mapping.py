@@ -20,6 +20,10 @@ def _clamp_brightness(value: float) -> int:
     return int(max(0, min(round(value), 255)))
 
 
+def _clamp_byte(value: float) -> int:
+    return int(max(0, min(round(value), 255)))
+
+
 def build_triplet_segment_specs(
         code_length: int,
         low_segments: Sequence[int],
@@ -118,4 +122,32 @@ def build_wled_state_json(
         })
     return json.dumps(
         {'on': True, 'bri': brightness_value, 'seg': segments},
+        separators=(',', ':'))
+
+
+def build_wled_idle_effect_json(
+        pixel_count: int,
+        color: Sequence[int],
+        brightness: float,
+        effect: int,
+        speed: int,
+        intensity: int,
+        palette: int) -> str:
+    if pixel_count <= 0:
+        raise ValueError('pixel_count must be positive')
+    if len(color) != 3:
+        raise ValueError('idle effect color must contain exactly three channels')
+    rgb = [_clamp_byte(channel) for channel in color]
+    segment = {
+        'id': 0,
+        'start': 0,
+        'stop': int(pixel_count),
+        'col': [rgb, [0, 0, 0]],
+        'fx': int(effect),
+        'sx': _clamp_byte(speed),
+        'ix': _clamp_byte(intensity),
+        'pal': int(palette),
+    }
+    return json.dumps(
+        {'on': True, 'bri': _clamp_brightness(brightness), 'seg': [segment]},
         separators=(',', ':'))

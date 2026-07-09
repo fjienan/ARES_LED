@@ -11,7 +11,11 @@ from std_msgs.msg import Int32
 
 from rgb_comm_protocol import FixedColorProtocol
 
-from .mapping import build_triplet_segment_specs, build_wled_state_json
+from .mapping import (
+    build_triplet_segment_specs,
+    build_wled_idle_effect_json,
+    build_wled_state_json,
+)
 
 
 _BAUD_RATES = {
@@ -106,7 +110,7 @@ class RgbLedSender(Node):
         super().__init__('rgb_led_sender')
         topic = self.declare_parameter('input_topic', '/aruco_comm/tx_id').value
         self.transport = str(self.declare_parameter('transport', 'serial').value).lower()
-        self.pixel_count = int(self.declare_parameter('pixel_count', 11).value)
+        self.pixel_count = int(self.declare_parameter('pixel_count', 6).value)
         retry_period = float(self.declare_parameter('retry_period_sec', 0.5).value)
         if self.pixel_count <= 0:
             raise ValueError('pixel_count must be positive')
@@ -139,7 +143,22 @@ class RgbLedSender(Node):
         self.wled_master_brightness = float(
             self.declare_parameter('wled_master_brightness', 255.0).value)
         self.initial_command_id = int(
-            self.declare_parameter('initial_command_id', 0).value)
+            self.declare_parameter('initial_command_id', -1).value)
+        self.idle_effect_enabled = bool(
+            self.declare_parameter('idle_effect_enabled', True).value)
+        self.idle_effect_color = [
+            int(v) for v in self.declare_parameter(
+                'idle_effect_color', [220, 0, 120]).value]
+        self.idle_effect_brightness = float(
+            self.declare_parameter('idle_effect_brightness', 20.0).value)
+        self.idle_effect_fx = int(
+            self.declare_parameter('idle_effect_fx', 28).value)
+        self.idle_effect_speed = int(
+            self.declare_parameter('idle_effect_speed', 160).value)
+        self.idle_effect_intensity = int(
+            self.declare_parameter('idle_effect_intensity', 120).value)
+        self.idle_effect_palette = int(
+            self.declare_parameter('idle_effect_palette', 0).value)
         self.display_segments = build_triplet_segment_specs(
             self.protocol.code_length,
             self.low_segments,
@@ -153,6 +172,20 @@ class RgbLedSender(Node):
         )
         self.pending_id: Optional[int] = None
         self.active_command: Optional[int] = None
+        self.idle_effect_payload = ''
+        if self.idle_effect_enabled:
+            self.idle_effect_payload = build_wled_idle_effect_json(
+                self.pixel_count,
+                self.idle_effect_color,
+                self.idle_effect_brightness,
+                self.idle_effect_fx,
+                self.idle_effect_speed,
+                self.idle_effect_intensity,
+                self.idle_effect_palette,
+            )
+        self.idle_effect_done = (
+            not self.idle_effect_enabled or self.initial_command_id >= 0)
+        self.idle_effect_sent = False
 
         self.serial: Optional[LineSerial] = None
         self.serial_device_config = ''
@@ -170,7 +203,8 @@ class RgbLedSender(Node):
             f'RGB LED sender ready: topic={topic}, transport={self.transport}, '
             f'low_segments={self.low_segments}, high_segments={self.high_segments}, '
             f'low_reverse={self.low_reverse_order}, '
-            f'high_reverse={self.high_reverse_order}, pixel_count={self.pixel_count}')
+            f'high_reverse={self.high_reverse_order}, pixel_count={self.pixel_count}, '
+            f'idle_effect={self.idle_effect_enabled and not self.idle_effect_done}')
 
     def _init_serial_transport(self) -> None:
         self.serial_device_config = str(
@@ -194,6 +228,7 @@ class RgbLedSender(Node):
         if self.protocol.encode_symbols(command) is None:
             self.get_logger().warning(f'command ID {command} is not in RGB protocol; ignored')
             return
+        self.idle_effect_done = True
         if command == self.pending_id or command == self.active_command:
             return
         self.pending_id = command
@@ -204,15 +239,8 @@ class RgbLedSender(Node):
 
     def _dispatch_serial(self) -> None:
         if self.pending_id is None:
+            self._dispatch_idle_serial()
             return
-        device = _find_serial_device(self.serial_device_config)
-        if device is None:
-            self.get_logger().warning('WLED serial device not found; retrying')
-            return
-        if self.serial is None or self.serial.device != device:
-            if self.serial is not None:
-                self.serial.close()
-            self.serial = LineSerial(device, self.serial_baudrate, self.serial_timeout_sec)
 
         command = self.pending_id
         code = self.protocol.encode_symbols(command)
@@ -227,12 +255,8 @@ class RgbLedSender(Node):
             self.brightness_mode,
             self.wled_master_brightness,
         )
-        try:
-            response = self.serial.write_line(f'{payload}\n')
-        except OSError as exc:
-            self.get_logger().warning(f'failed to write WLED serial {device}: {exc}; retrying')
-            if self.serial is not None:
-                self.serial.close()
+        response = self._write_serial_payload(payload)
+        if response is None:
             return
 
         self.pending_id = None
@@ -241,6 +265,38 @@ class RgbLedSender(Node):
             self.get_logger().info(f'sent command {command}: {code}; WLED replied: {response}')
         else:
             self.get_logger().info(f'sent command {command}: {code}')
+
+    def _dispatch_idle_serial(self) -> None:
+        if self.idle_effect_done or self.idle_effect_sent or not self.idle_effect_payload:
+            return
+        response = self._write_serial_payload(self.idle_effect_payload)
+        if response is None:
+            return
+
+        self.idle_effect_sent = True
+        if response:
+            self.get_logger().info(f'sent idle WLED effect; WLED replied: {response}')
+        else:
+            self.get_logger().info('sent idle WLED effect')
+
+    def _write_serial_payload(self, payload: str) -> Optional[str]:
+        device = _find_serial_device(self.serial_device_config)
+        if device is None:
+            self.get_logger().warning('WLED serial device not found; retrying')
+            return None
+        if self.serial is None or self.serial.device != device:
+            if self.serial is not None:
+                self.serial.close()
+            self.serial = LineSerial(device, self.serial_baudrate, self.serial_timeout_sec)
+
+        try:
+            response = self.serial.write_line(f'{payload}\n')
+        except OSError as exc:
+            self.get_logger().warning(f'failed to write WLED serial {device}: {exc}; retrying')
+            if self.serial is not None:
+                self.serial.close()
+            return None
+        return response
 
     def destroy_node(self) -> bool:
         if self.serial is not None:

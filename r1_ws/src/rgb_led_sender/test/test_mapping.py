@@ -3,11 +3,12 @@ import pytest
 from rgb_led_sender.mapping import (
     WledSegmentSpec,
     build_triplet_segment_specs,
+    build_wled_idle_effect_json,
     build_wled_state_json,
 )
 
 
-def test_build_wled_state_json_lights_six_segments_and_clears_rest():
+def test_build_wled_state_json_lights_six_segments():
     specs = build_triplet_segment_specs(
         code_length=3,
         low_segments=[0, 1, 2],
@@ -22,7 +23,7 @@ def test_build_wled_state_json_lights_six_segments_and_clears_rest():
     payload = build_wled_state_json(
         [(0, 0, 255), (255, 0, 255), (255, 0, 0)],
         specs,
-        pixel_count=11,
+        pixel_count=6,
     )
 
     assert payload == (
@@ -32,8 +33,27 @@ def test_build_wled_state_json_lights_six_segments_and_clears_rest():
         '{"id":2,"start":2,"stop":3,"col":[[255,0,0]],"fx":0,"bri":6},'
         '{"id":3,"start":3,"stop":4,"col":[[0,0,255]],"fx":0,"bri":60},'
         '{"id":4,"start":4,"stop":5,"col":[[255,0,255]],"fx":0,"bri":60},'
-        '{"id":5,"start":5,"stop":6,"col":[[255,0,0]],"fx":0,"bri":60},'
-        '{"id":6,"start":6,"stop":11,"col":[[0,0,0]],"fx":0}'
+        '{"id":5,"start":5,"stop":6,"col":[[255,0,0]],"fx":0,"bri":60}'
+        ']}'
+    )
+
+
+def test_build_wled_idle_effect_json_uses_six_segment_orange_yellow_effect():
+    payload = build_wled_idle_effect_json(
+        pixel_count=6,
+        color=[220, 0, 120],
+        brightness=20.0,
+        effect=28,
+        speed=160,
+        intensity=120,
+        palette=0,
+    )
+
+    assert payload == (
+        '{"on":true,"bri":20,"seg":['
+        '{"id":0,"start":0,"stop":6,'
+        '"col":[[220,0,120],[0,0,0]],'
+        '"fx":28,"sx":160,"ix":120,"pal":0}'
         ']}'
     )
 

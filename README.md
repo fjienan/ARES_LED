@@ -115,6 +115,10 @@ usb-ARM_DAPLink_CMSIS-DAP_... -> ../../ttyACM0
 ```yaml
 transport: serial
 serial_device: auto
+pixel_count: 6
+initial_command_id: -1
+idle_effect_enabled: true
+idle_effect_color: [220, 0, 120]
 ```
 
 如自动选择错误，可把 `serial_device` 改为上面的
@@ -122,7 +126,9 @@ serial_device: auto
 
 WLED 灯带连接：24V 电源正极接灯带 `+`，电源负极接灯带 `GND`，WLED `GND` 与灯带
 `GND` 共地，WLED `DO` 接灯带 `DIN`。不要把 24V 接到 WLED 板的 5V。
-发送命令后，前 6 个物理段会一直保持对应颜色，直到收到下一条命令；后面的段会被发送端置灭。
+默认总段数为 6。启动后、收到第一条真实命令前，R1 会发送 WLED 内置跑马灯效果；
+当前 idle 颜色 `[220, 0, 120]` 在这条灯带上视觉接近橙黄色，不属于 R2 协议色。
+收到第一条合法命令后，跑马灯立即停止，6 个物理段会一直保持对应协议颜色，直到收到下一条命令。
 
 六段显示顺序在 `r1_ws/src/rgb_led_sender/config/sender.yaml` 中配置：
 
@@ -161,7 +167,7 @@ sleep 1
 整条测试红色：
 
 ```bash
-printf '{"on":true,"bri":40,"seg":[{"id":0,"start":0,"stop":11,"col":[[255,0,0]],"fx":0}]}\n' >&3
+printf '{"on":true,"bri":40,"seg":[{"id":0,"start":0,"stop":6,"col":[[255,0,0]],"fx":0}]}\n' >&3
 ```
 
 关闭：
