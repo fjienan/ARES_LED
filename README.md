@@ -48,7 +48,7 @@ R1 使用 6 个物理段显示同一个三段协议码：`0,1,2` 为低亮度组
 
 | 命令 ID | 三段颜色 |
 |---:|:---:|
-| 0 | BLUE, PURPLE, RED |
+| 0 | R1 特殊命令：平滑 Colorloop 待机效果 |
 | 1 | BLUE, RED, GREEN |
 | 2 | BLUE, GREEN, PURPLE |
 | 3 | RED, GREEN, BLUE |
@@ -58,8 +58,9 @@ R1 使用 6 个物理段显示同一个三段协议码：`0,1,2` 为低亮度组
 | 7 | GREEN, RED, PURPLE |
 | 8 | RED, PURPLE, GREEN |
 
-命令 `0` 是内部重置命令。R2 确认 `0` 后只清除去重状态，不向 `/aruco_comm/rx_id`
-发布；它用于让相邻两个相同动作 ID 可以再次触发。
+R1 将命令 `0` 直接解释为 WLED Colorloop 控制命令，不再输出原来的
+`BLUE, PURPLE, RED` 三段颜色。shared 协议中仍保留旧映射以兼容现有 R2 代码，
+但 R1 发送节点不会使用该映射编码命令 `0`。
 
 ## R1 构建与启动
 
@@ -118,7 +119,11 @@ serial_device: auto
 pixel_count: 6
 initial_command_id: -1
 idle_effect_enabled: true
-idle_effect_color: [220, 0, 120]
+idle_effect_brightness: 20.0
+idle_effect_fx: 8
+idle_effect_speed: 64
+idle_effect_intensity: 128
+idle_command_delay_sec: 0.1
 ```
 
 如自动选择错误，可把 `serial_device` 改为上面的
@@ -126,9 +131,12 @@ idle_effect_color: [220, 0, 120]
 
 WLED 灯带连接：24V 电源正极接灯带 `+`，电源负极接灯带 `GND`，WLED `GND` 与灯带
 `GND` 共地，WLED `DO` 接灯带 `DIN`。不要把 24V 接到 WLED 板的 5V。
-默认总段数为 6。启动后、收到第一条真实命令前，R1 会发送 WLED 内置跑马灯效果；
-当前 idle 颜色 `[220, 0, 120]` 在这条灯带上视觉接近橙黄色，不属于 R2 协议色。
-收到第一条合法命令后，跑马灯立即停止，6 个物理段会一直保持对应协议颜色，直到收到下一条命令。
+默认总段数为 6。启动后或收到命令 `0` 时，R1 会在固定的 6 个物理段上启动 WLED
+内置 Colorloop（`fx=8`）。待机与静态命令使用完全相同的分段 ID 和范围，切换时不会
+删除、合并或重建分段；Colorloop 不传颜色或调色板参数。
+收到命令 `1..8` 后，Colorloop 立即停止，6 个物理段会一直保持对应协议颜色，
+直到收到下一条命令；命令 `0` 持续 100 ms 后会重新进入 Colorloop 状态。这个短延迟会
+过滤控制链在真实命令前发送的瞬时复位 `0`，静态命令本身仍会立即生效。
 
 六段显示顺序在 `r1_ws/src/rgb_led_sender/config/sender.yaml` 中配置：
 
@@ -155,6 +163,12 @@ ros2 topic pub --once /aruco_comm/tx_id std_msgs/msg/Int32 '{data: 1}'
 ros2 topic pub --once /aruco_comm/tx_id std_msgs/msg/Int32 '{data: 8}'
 ```
 
+切回 Colorloop：
+
+```bash
+ros2 topic pub --once /aruco_comm/tx_id std_msgs/msg/Int32 '{data: 0}'
+```
+
 也可以绕过 ROS，直接测试 WLED 串口。建议在同一个终端保持串口长连接：
 
 ```bash
@@ -164,10 +178,10 @@ exec 3<>"$PORT"
 sleep 1
 ```
 
-整条测试红色：
+保持六段结构并测试整条红色：
 
 ```bash
-printf '{"on":true,"bri":40,"seg":[{"id":0,"start":0,"stop":6,"col":[[255,0,0]],"fx":0}]}\n' >&3
+printf '{"on":true,"bri":255,"tt":0,"seg":[{"id":0,"start":0,"stop":1,"col":[[255,0,0]],"fx":0,"bri":40},{"id":1,"start":1,"stop":2,"col":[[255,0,0]],"fx":0,"bri":40},{"id":2,"start":2,"stop":3,"col":[[255,0,0]],"fx":0,"bri":40},{"id":3,"start":3,"stop":4,"col":[[255,0,0]],"fx":0,"bri":40},{"id":4,"start":4,"stop":5,"col":[[255,0,0]],"fx":0,"bri":40},{"id":5,"start":5,"stop":6,"col":[[255,0,0]],"fx":0,"bri":40}]}\n' >&3
 ```
 
 关闭：

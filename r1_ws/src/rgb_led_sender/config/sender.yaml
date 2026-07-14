@@ -26,15 +26,16 @@ rgb_led_sender:
     # 使用每段 bri 时，全局主亮度保持 255，实际亮度由各段 bri 控制。
     wled_master_brightness: 255.0
     retry_period_sec: 0.5
-    # 启动后不刷内部重置命令；收到第一条真实命令前显示 WLED 内置跑马灯。
+    # -1 表示启动后直接进入 idle；命令 0 也会在运行中切回 WLED Colorloop。
+    # 命令 0 不再显示 shared 协议中的 BLUE/PURPLE/RED。
     initial_command_id: -1
     idle_effect_enabled: true
-    # 当前 WLED/灯带通道下，视觉上接近橙黄色，且不是 R2 协议色。
-    idle_effect_color: [220, 0, 120]
+    # Colorloop 在固定六段拓扑上平滑循环颜色，不使用颜色或调色板参数。
     idle_effect_brightness: 20.0
-    idle_effect_fx: 28
-    idle_effect_speed: 160
-    idle_effect_intensity: 120
-    idle_effect_palette: 0
+    idle_effect_fx: 8
+    idle_effect_speed: 64
+    idle_effect_intensity: 128
+    # 忽略控制链中紧接真实命令之前的短暂命令 0，避免 WLED 状态来回切换。
+    idle_command_delay_sec: 0.1
     # R1 物理输出的 RGB 配置，与 R2 摄像头观测值无关。
     colors_config: ""

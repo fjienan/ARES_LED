@@ -121,33 +121,42 @@ def build_wled_state_json(
             'fx': 0,
         })
     return json.dumps(
-        {'on': True, 'bri': brightness_value, 'seg': segments},
+        {'on': True, 'bri': brightness_value, 'tt': 0, 'seg': segments},
         separators=(',', ':'))
 
 
 def build_wled_idle_effect_json(
+        display_segments: Sequence[WledSegmentSpec],
         pixel_count: int,
-        color: Sequence[int],
         brightness: float,
         effect: int,
         speed: int,
         intensity: int,
-        palette: int) -> str:
+        master_brightness: float = 255.0) -> str:
+    if not display_segments:
+        raise ValueError('display_segments must not be empty')
     if pixel_count <= 0:
         raise ValueError('pixel_count must be positive')
-    if len(color) != 3:
-        raise ValueError('idle effect color must contain exactly three channels')
-    rgb = [_clamp_byte(channel) for channel in color]
-    segment = {
-        'id': 0,
-        'start': 0,
-        'stop': int(pixel_count),
-        'col': [rgb, [0, 0, 0]],
-        'fx': int(effect),
-        'sx': _clamp_byte(speed),
-        'ix': _clamp_byte(intensity),
-        'pal': int(palette),
-    }
+    segments = []
+    for spec in sorted(display_segments, key=lambda item: item.segment_id):
+        if spec.start < 0 or spec.stop <= spec.start or spec.stop > pixel_count:
+            raise ValueError(
+                f'invalid WLED range for segment {spec.segment_id}: '
+                f'{spec.start}..{spec.stop}')
+        segments.append({
+            'id': int(spec.segment_id),
+            'start': int(spec.start),
+            'stop': int(spec.stop),
+            'fx': int(effect),
+            'sx': _clamp_byte(speed),
+            'ix': _clamp_byte(intensity),
+            'bri': _clamp_brightness(brightness),
+        })
     return json.dumps(
-        {'on': True, 'bri': _clamp_brightness(brightness), 'seg': [segment]},
+        {
+            'on': True,
+            'bri': _clamp_brightness(master_brightness),
+            'tt': 0,
+            'seg': segments,
+        },
         separators=(',', ':'))
